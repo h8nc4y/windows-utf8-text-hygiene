@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a sanitized problem with the skill or examples.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not paste tokens, credentials, raw agent transcripts with private data, private repository names, internal absolute paths, or fragments of real private documents (mojibake included — garbled private text is still private text). Use synthetic fixtures such as 日本語テスト.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observable problem without private data.
+      placeholder: Following the skill, the strict decode passed but the normalized file still...
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom class
+      options:
+        - Irreversible corruption despite following the skill (guard gap)
+        - Strict-decode guard false pass or false refusal
+        - BOM detection or removal issue
+        - Windows PowerShell 5.1 BOM exception issue (.ps1)
+        - NUL-byte detection issue (rg / grep -a behavior)
+        - CRLF or trailing-whitespace detection issue (git diff --check)
+        - Backtick-expansion prevention issue (here-string pattern)
+        - Hook stdout encoding issue
+        - Documentation error or unclear guidance
+        - Other sanitized symptom
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Encoding behavior is version- and locale-sensitive.
+      placeholder: |
+        OS: Windows 11
+        PowerShell: pwsh 7.4 / Windows PowerShell 5.1
+        System locale / ANSI code page: ja-JP / CP932
+        ripgrep: 14.x
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized-checks
+    attributes:
+      label: Sanitized checks performed
+      description: Summarize safe facts only. Use placeholder file names and synthetic text.
+      placeholder: |
+        Strict decode ([System.Text.UTF8Encoding]::new($false, $true)): no exception
+        rg -al '\x00' on the file: no hit
+        git diff --check / --cached --check: both clean
+        BOM byte check: False
+        Synthetic reproduction content: 日本語テスト
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: The strict decode should have thrown DecoderFallbackException for this input.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: The read succeeded and the written file contained U+FFFD characters.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed tokens, credentials, customer data, private repository names, internal absolute paths, and fragments of real private documents (including their mojibake).
+          required: true
