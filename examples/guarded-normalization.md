@@ -38,11 +38,23 @@ anywhere, paths are explicit):
 
 ```powershell
 $repo = '<repo>'
-# Changed + added files from git status --short (first two columns are status)
-$files = git -C $repo status --short |
-  ForEach-Object { $_.Substring(3) } |
-  Where-Object { $_ -match '\.(md|txt|yml|yaml|json|py|js|ts)$' } |
-  ForEach-Object { Join-Path $repo $_ }
+# Changed + added files via NUL-separated porcelain output. -z prints paths
+# raw and unquoted; naive `git status --short` parsing does not survive this
+# skill's own domain: with default core.quotepath, Japanese file names
+# arrive octal-escaped ("\346\227\245..." inside quotes) and names with
+# spaces arrive double-quoted — both silently fail an extension filter
+# (measured). -z is immune to both.
+$raw = (git -C $repo status --porcelain=v1 -z) -join ''
+$entries = $raw -split "`0" | Where-Object { $_ }
+$files = @()
+for ($i = 0; $i -lt $entries.Count; $i++) {
+    $status = $entries[$i].Substring(0, 2)
+    $path = $entries[$i].Substring(3)
+    if ($status -match 'R') { $i++; continue }   # rename: skip entry + its old-path token
+    if ($status -match 'D') { continue }         # deleted: nothing left to normalize
+    $files += Join-Path $repo $path
+}
+$files = $files | Where-Object { $_ -match '\.(md|txt|yml|yaml|json|py|js|ts)$' }
 
 $skipped = @()
 foreach ($path in $files) {
@@ -72,10 +84,15 @@ Notes:
   repository. Never let it pull in binaries.
 - The rewrite preserves the file's final-newline state (split/join keeps a
   trailing empty element); it does not add a missing final newline.
-- `git status --short` paths are relative to the repo root; the
-  `Substring(3)` strips the two status columns and the separating space.
-  Renames (`R  old -> new`) need extra handling — with renames present,
-  build the list manually instead.
+- The enumeration was exercised against a repository containing a
+  Japanese-named file, a name with spaces, a staged rename, and a deleted
+  file: the rename pair and the deletion are skipped, the non-ASCII and
+  space-bearing names come through intact (measured).
+- Run the loop under `pwsh` 7, whose console encoding defaults to UTF-8.
+  Under Windows PowerShell 5.1, git's output with non-ASCII file names may
+  be decoded as the ANSI code page and corrupt the list before it is used.
+- Porcelain paths are repo-root-relative, so `$repo` must be the
+  repository root for `Join-Path` to resolve them.
 
 ## The PowerShell 5.1 exception
 

@@ -24,9 +24,11 @@ repositories hit a recurring family of text-corruption incidents:
   failure modes go beyond parse errors: a Japanese comment line can
   **swallow the following newline**, fusing the next statement into the
   comment — the script exits 0 and the statement simply never ran.
-- ripgrep appears to "go blind" on NUL-contaminated files: without `-a` it
-  refuses `\x00` patterns outright (`pattern contains "\0" but it is
-  impossible to match`), so naive scans report a false all-clear.
+- NUL-byte scans need `-a` on both major tools, with different failure
+  shapes when it is missing: ripgrep refuses the `\x00` pattern outright
+  (`pattern contains "\0" but it is impossible to match`, exit 2), while
+  grep silently treats the file as binary and reports nothing — a true
+  false all-clear.
 - `git diff --check` sees only unstaged changes; once you `git add`, the
   same trailing-whitespace problems pass silently unless you also run
   `--cached --check`.
@@ -77,10 +79,11 @@ Install for your user account from PowerShell:
 ```powershell
 $dest = Join-Path $HOME '.claude\skills\windows-utf8-text-hygiene'
 if (Test-Path -LiteralPath $dest) {
-  throw "Install target already exists: $dest"
+  Write-Host "Install target already exists: $dest"
+} else {
+  New-Item -ItemType Directory -Path $dest | Out-Null
+  Copy-Item -LiteralPath .\SKILL.md -Destination (Join-Path $dest 'SKILL.md')
 }
-New-Item -ItemType Directory -Path $dest | Out-Null
-Copy-Item -LiteralPath .\SKILL.md -Destination (Join-Path $dest 'SKILL.md')
 ```
 
 Notes:
@@ -112,10 +115,11 @@ Manual Codex-style skill install from PowerShell:
 ```powershell
 $dest = Join-Path $HOME '.agents\skills\windows-utf8-text-hygiene'
 if (Test-Path -LiteralPath $dest) {
-  throw "Install target already exists: $dest"
+  Write-Host "Install target already exists: $dest"
+} else {
+  New-Item -ItemType Directory -Path $dest | Out-Null
+  Copy-Item -LiteralPath .\SKILL.md -Destination (Join-Path $dest 'SKILL.md')
 }
-New-Item -ItemType Directory -Path $dest | Out-Null
-Copy-Item -LiteralPath .\SKILL.md -Destination (Join-Path $dest 'SKILL.md')
 ```
 
 To scope the skill to a single project instead, copy `SKILL.md` to

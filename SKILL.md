@@ -75,8 +75,12 @@ string literals (all three reproduce with the katakana `ト`, UTF-8
 2. **`TerminatorExpectedAtEndOfString`.** A string literal ending in such a
    byte swallows its own closing quote (`0x27`), producing "The string is
    missing the terminator".
-3. **`UnexpectedToken`.** The same mechanism inside a `param(...)` block
-   eats a structural token, breaking the surrounding function definition.
+3. **`UnexpectedToken`.** The same mechanism eats a structural token,
+   breaking the surrounding construct — measured as `Unexpected token '}'`
+   on a function's closing brace after a `param(...)` default-value string
+   lost its terminator. The exact parser error ID varies with the
+   construction; the constant part is the mechanism and the broken
+   surrounding definition.
 
 The same BOM-less file runs correctly under `pwsh` 7, and the same file
 with a BOM runs correctly under 5.1 — hence the exception.
