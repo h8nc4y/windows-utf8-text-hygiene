@@ -6,6 +6,43 @@ The format loosely follows Keep a Changelog conventions.
 
 ## Unreleased
 
+### Changed
+
+- Hardened private-marker scanning so Git file enumeration runs in bounded,
+  hermetic child processes. Ambient `GIT_*`, home/config, hooks, attributes,
+  excludes, templates, filters, prompts, and trace settings can no longer
+  redirect tracked-file discovery or create scan-side artifacts.
+- Closed the Windows start-before-Job-assignment race with suspended direct
+  creation, a three-handle inheritance allowlist, Job assignment, and
+  resume; read unique staged blobs through one binary-safe batch; require
+  exact final raw stage/flag snapshots; and cover high-signal `.env`,
+  PEM/key, extensionless, and dotfile candidates.
+- Added an atomic POSIX session/process-group boundary, direct `kill(2)`
+  cleanup with errno-aware `ESRCH` handling, Ubuntu descendant pipe/sentinel
+  regression coverage, and a dedicated Ubuntu 24.04 CI job.
+- Bounded line traversal, regex-match traversal, per-file and total
+  findings, and diagnostic width; escaped control/format, bidi, and
+  Unicode line/paragraph separator characters in diagnostics; and
+  excluded leaf `.git` files from non-Git fallback scanning.
+- Added adversarial success/failure fixtures that preserve the parent
+  environment (including present-empty values), verify target-repository
+  enumeration, staged/worktree union, real staged add/replace drift,
+  flags-only metadata drift, present/missing-worktree intent-to-add,
+  ordinary staged empty blobs, delay-free immediate descendants,
+  fail-closed index states, descendant
+  pipe cleanup, replace-ref isolation, no-fetch promisor handling, dangling
+  `.git` markers, leaf gitfiles, parent-directory junctions, ambient OS
+  forgery, exact/over-limit raw UTF-8 bytes, hostile nonexistent paths,
+  exact fixed raw diagnostics without PowerShell exception framing,
+  match/finding amplification, Git-unavailable repository
+  boundaries, tracked local-marker rejection, and redaction, and exercise
+  PowerShell 7 and Windows PowerShell 5.1 as distinct hosts.
+- Declared the intentional UTF-8 BOM on the Japanese-commented scanner,
+  process-boundary, and self-test scripts that Windows PowerShell 5.1
+  executes, and bounded the CI job.
+- Pinned the CI checkout action to the verified `v5` commit instead of a
+  mutable tag.
+
 ## 0.1.0 - 2026-07-16
 
 ### Added

@@ -58,6 +58,42 @@ possible secret format and is no substitute for keeping real credentials
 out of the repository in the first place. Treat a passing scan as "no
 known marker found," not "definitely safe."
 
+When Git is available, tracked-file enumeration runs in finite-time child
+processes with a sanitized environment and isolated configuration.
+On Windows, the requested executable is created suspended with a
+three-handle standard-I/O allowlist, assigned to a kill-on-close Job, and
+resumed only after assignment. This closes the start-before-assignment
+descendant race.
+Ambient repository redirects (`GIT_DIR`, worktree/index/object variables),
+config injection, hooks, attributes, excludes, templates, filters, prompts,
+and trace settings are not inherited by those Git children. Promisor-remote
+lazy fetches and replacement refs are disabled, preventing a scan from
+retrieving a missing object or substituting another blob for an index OID.
+The scanner does not mutate the caller's environment. It scans staged
+blobs and differing regular worktree files for common text/source/config
+extensions, extensionless names, `.env`, `.env.*`, `*.env`, `.pem`, `.key`,
+and selected high-signal dotfiles. Unknown extensions remain outside this
+targeted text classifier. Unique staged blobs are read through one bounded
+binary-safe batch, and byte-identical final raw stage/flag enumerations are
+required after marker analysis and immediately before reporting.
+Line length/count, per-rule match traversal, per-file/total findings, and
+diagnostic width are separately bounded. Output escapes control/format,
+bidi, and Unicode line/paragraph separator characters; matched values
+remain redacted. Raw process-byte limits include prefixes and the actual
+platform newline, and an unresolvable user path is replaced by a fixed
+diagnostic. Non-Git fallback excludes `.git` whether it is a
+directory or a leaf gitfile.
+Conflicted, intent-to-add (present or missing worktree), mid-scan index
+or flags-only mutation, symlink/reparse
+(including dangling
+`.git` markers and parent-directory junctions), gitlink, malformed,
+timed-out, or incomplete-stream states fail closed. A tracked
+`.private-markers.local` file is also rejected because that file is an
+untracked-only input. Working-tree fallback is used only when Git is
+unavailable and no `.git` entry exists in the target ancestry, or when Git
+explicitly confirms the path is not a repository; other Git failures do
+not silently broaden or change scope.
+
 ## Response Expectations
 
 Maintainers should acknowledge actionable security reports when available,

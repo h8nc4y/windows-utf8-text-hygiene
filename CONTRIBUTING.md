@@ -40,10 +40,13 @@ behavior. Keep it that way:
 
 ## Repository Hygiene (dogfooding)
 
-This repository follows its own convention: every tracked text file is
-UTF-8 without BOM, LF, no trailing whitespace, no NUL bytes. Before
-opening a pull request, run the skill's own inspection steps on your
-changes — CI enforces the whitespace part and will fail on violations.
+This repository follows its own convention: tracked text is UTF-8 without
+BOM, LF, no trailing whitespace, and no NUL bytes. The documented
+exception applies to `.ps1` files with Japanese comments that are executed
+by Windows PowerShell 5.1: those files intentionally retain a UTF-8 BOM.
+Before opening a pull request, run the skill's own inspection steps on
+your changes — CI enforces the scanner scripts' BOM contract and the
+whitespace checks.
 
 ## Development Workflow
 

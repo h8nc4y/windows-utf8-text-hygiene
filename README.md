@@ -171,9 +171,12 @@ repository paths you cannot publish, or customer data in public issues.
 
 ## Dogfooding
 
-This repository follows its own convention: every tracked text file is
-UTF-8 without BOM, LF, with no trailing whitespace and no NUL bytes. The
-CI workflow enforces the whitespace part on every push and pull request
+This repository follows its own convention: tracked text is UTF-8 without
+BOM, LF, with no trailing whitespace and no NUL bytes. The deliberate
+exception is the scanner and process-boundary `.ps1` files with Japanese
+comments that Windows PowerShell 5.1 executes; those files retain a UTF-8
+BOM so 5.1 cannot misread them as CP932. CI validates that exception and
+the whitespace rules on every push and pull request
 (`git diff-tree --check` against the empty tree), and the skill's own
 inspection commands were run against the repository before publication.
 
@@ -285,7 +288,61 @@ git diff --cached --check
 
 The GitHub Actions workflow runs the same validation, scan self-test,
 private-marker scan, and whitespace check on pull requests and pushes to
-`main`.
+`main`. Windows runs the self-test separately under PowerShell 7 and
+Windows PowerShell 5.1; Ubuntu 24.04 runs the PowerShell 7 self-test to
+exercise POSIX process containment. Each validation job has a finite
+timeout, and the self-test always reuses the host that started it instead
+of silently substituting `pwsh` for a 5.1 check.
+
+Git-backed file enumeration is also hermetic and bounded. Each `git`
+probe receives a sanitized child-only environment, empty global/system
+configuration, and inert hook/attribute/exclude/template settings.
+Its per-command deadline defaults to 15 seconds and cannot be raised
+above that value; the self-test lowers it only for the synthetic hang
+fixture.
+On Windows, the requested executable is created suspended with only its
+three standard-I/O handles inheritable, assigned to a kill-on-close Job,
+and resumed only after assignment. An immediately spawning command
+therefore cannot create a descendant outside the Job during assignment.
+On POSIX, the requested executable starts in a dedicated session/process
+group before its first instruction. Cleanup signals that whole group with
+`kill(2)` and treats only success or `ESRCH` as a successful stop; permission
+and other signal failures remain fail-closed.
+Ambient `GIT_*`, home/config, prompt, filter, or trace settings cannot
+redirect the scan to another repository or create trace artifacts. The
+scanner also disables promisor-remote lazy fetches and replacement refs,
+so a local scan neither retrieves a missing object nor substitutes another
+blob for the OID recorded in the index. It never mutates the caller's
+process environment. In a repository, one binary-safe `git cat-file
+--batch` reads the unique staged blobs for recognized text candidates:
+common source/config text extensions, extensionless names, `.env`,
+`.env.*`, `*.env`, `.pem`, `.key`, and selected high-signal dotfiles such
+as `.npmrc`. Differing regular worktree content is scanned as well. Unknown
+extensions are skipped to avoid decoding binary files; this remains a
+targeted marker scanner, not a universal content classifier. After all
+index/worktree snapshots are collected and analyzed, the scanner repeats
+the same hermetic `git ls-files -z --stage` and index-debug queries
+immediately before its result and requires byte-identical raw output,
+rejecting staged additions, replacements, or flag-only changes that
+occurred mid-scan.
+Text decoding, line length/count, regex matches, findings per file,
+findings per scan, and diagnostic width are independently bounded.
+Diagnostics escape control/format characters (including bidi controls)
+and Unicode line/paragraph separators instead of emitting them raw.
+Process output limits are measured from the actual raw byte stream,
+including prefixes and the platform newline; an exact limit is accepted
+and the next byte fails closed. Unresolvable user-supplied paths are
+reported with fixed diagnostics rather than replaying the path.
+Same-line duplicate matches are collapsed, so adversarial input cannot
+multiply the report without limit. In non-Git fallback, both `.git`
+directories and leaf gitfiles are excluded from content scanning.
+Conflicts, intent-to-add entries (including missing-worktree entries),
+symlinks/reparse points (including a
+dangling `.git` marker or a junction in a tracked file's parent chain),
+gitlinks, malformed Git output, incomplete pipe reads, and Git failures
+other than an explicit "not a repository" result fail closed instead of
+silently switching scan scope. If Git is unavailable, a `.git` entry in
+the target or its ancestry also blocks working-tree fallback.
 
 ## Contributing
 
@@ -299,7 +356,8 @@ repository names, internal absolute paths, or customer data.
 For local-only private markers, create an untracked `.private-markers.local`
 file with one literal marker per line, or set
 `WINDOWS_UTF8_TEXT_HYGIENE_PRIVATE_MARKERS` with newline-separated markers.
-The scanner reads these values but does not print the matched marker.
+The scanner reads these values but does not print the matched marker. It
+fails closed if `.private-markers.local` appears in the Git index.
 
 ## Security
 
