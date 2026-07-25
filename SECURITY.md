@@ -94,6 +94,16 @@ unavailable and no `.git` entry exists in the target ancestry, or when Git
 explicitly confirms the path is not a repository; other Git failures do
 not silently broaden or change scope.
 
+Every regular expression in `scripts/scan-private-markers.ps1` that parses
+scan targets or Git output uses the PowerShell 5.1-compatible three-argument
+.NET constructor and a finite match timeout capped at 250 ms and clamped to
+the scan-wide budget. A timeout at `Match`, `IsMatch`, or `NextMatch` is
+retained until Git isolation cleanup has succeeded, then emits only the
+fixed redacted `regex-timeout` integrity diagnostic and
+exits 2. Input, pattern, exception, and local-path content are not replayed
+by that timeout diagnostic. A Git-isolation cleanup or boundary-integrity
+failure retains precedence instead of being relabeled as a regex timeout.
+
 ## Response Expectations
 
 Maintainers should acknowledge actionable security reports when available,

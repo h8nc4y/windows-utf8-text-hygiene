@@ -85,6 +85,17 @@ pwsh -NoProfile -File ./scripts/test-scan-private-markers.ps1
 pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 ```
 
+The scanner self-test includes a near-limit safe line and an adversarial
+one-million-character no-match line. The safe control must pass, while a
+regex timeout must finish inside the bounded process window, emit only the
+fixed redacted `regex-timeout` line, and exit 2 without exposing fixture or
+repository paths. Readiness parses the production scanner AST: it rejects
+regex operators, casts and arrays, shortened or alternate Regex types,
+`switch -Regex`, `Select-String`, and dynamic or Regex `New-Object` types.
+It also pins the sole three-argument constructor to the timeout derived
+from `Math.Min(250, scan-wide budget)`, with mutation fixtures for each
+entry point and timeout-provenance replacement.
+
 ## Pull Request Expectations
 
 - Explain the problem and the chosen fix.

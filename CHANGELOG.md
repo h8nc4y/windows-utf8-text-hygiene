@@ -24,6 +24,13 @@ The format loosely follows Keep a Changelog conventions.
   findings, and diagnostic width; escaped control/format, bidi, and
   Unicode line/paragraph separator characters in diagnostics; and
   excluded leaf `.git` files from non-Git fallback scanning.
+- Added a finite, PowerShell 5.1-compatible .NET match timeout to every regex
+  in `scripts/scan-private-markers.ps1`. Regex timeouts now fail closed with
+  one fixed redacted exit-2 diagnostic after successful Git-isolation cleanup;
+  Git-isolation integrity failures retain precedence. This is backed by an
+  adversarial one-million-character no-match regression, a near-limit safe
+  positive control, and an AST mutation gate covering alternate construction
+  paths and timeout provenance.
 - Added adversarial success/failure fixtures that preserve the parent
   environment (including present-empty values), verify target-repository
   enumeration, staged/worktree union, real staged add/replace drift,

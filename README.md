@@ -173,9 +173,10 @@ repository paths you cannot publish, or customer data in public issues.
 
 This repository follows its own convention: tracked text is UTF-8 without
 BOM, LF, with no trailing whitespace and no NUL bytes. The deliberate
-exception is the scanner and process-boundary `.ps1` files with Japanese
-comments that Windows PowerShell 5.1 executes; those files retain a UTF-8
-BOM so 5.1 cannot misread them as CP932. CI validates that exception and
+exception is the validation, scanner, self-test, and process-boundary
+`.ps1` files with Japanese comments that Windows PowerShell 5.1 executes;
+those files retain a UTF-8 BOM so 5.1 cannot misread them as CP932. CI
+validates that exception and
 the whitespace rules on every push and pull request
 (`git diff-tree --check` against the empty tree), and the skill's own
 inspection commands were run against the repository before publication.
@@ -327,6 +328,15 @@ rejecting staged additions, replacements, or flag-only changes that
 occurred mid-scan.
 Text decoding, line length/count, regex matches, findings per file,
 findings per scan, and diagnostic width are independently bounded.
+Every regular expression in `scripts/scan-private-markers.ps1` that parses
+scan targets or Git output uses the PowerShell 5.1-compatible three-argument
+.NET constructor with a finite match timeout of at most 250 ms. Regex
+operators and alternate construction paths are rejected by an AST readiness
+gate. A timeout is held until Git isolation
+cleanup has succeeded, then returns one fixed redacted `regex-timeout`
+line and exit code 2 without replaying the input, pattern, or local path.
+If Git-isolation cleanup or its integrity checks fail, that higher-priority
+failure retains precedence and is not misreported as a regex timeout.
 Diagnostics escape control/format characters (including bidi controls)
 and Unicode line/paragraph separators instead of emitting them raw.
 Process output limits are measured from the actual raw byte stream,

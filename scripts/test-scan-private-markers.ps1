@@ -202,12 +202,62 @@ function ConvertTo-TestProcessResult {
         ExitCode = $exitCode
         RawExitCode = $Result.ExitCode
         Output = $output
+        StandardOutputBytes = [byte[]]$Result.StandardOutputBytes
+        StandardErrorBytes = [byte[]]$Result.StandardErrorBytes
         TimedOut = $Result.TimedOut
         OutputLimitExceeded = $Result.OutputLimitExceeded
         InputWriteFailed = $Result.InputWriteFailed
         PipeLeakDetected = $Result.PipeLeakDetected
         StreamsCompleted = $Result.StreamsCompleted
         TreeStopped = $Result.TreeStopped
+    }
+}
+
+function Assert-FixedRegexTimeoutFailure {
+    param(
+        [pscustomobject]$Result,
+        [string[]]$ForbiddenPaths
+    )
+
+    $expected =
+        'Private marker scan failed closed (integrity: regex-timeout).'
+    $expectedStderrBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
+        $expected + [Environment]::NewLine
+    )
+    if ($Result.ExitCode -ne 2 -or
+        $Result.Output.Trim() -cne $expected -or
+        $Result.StandardOutputBytes.Length -ne 0 -or
+        -not (Test-ByteArraysEqual `
+            -Expected $expectedStderrBytes `
+            -Actual $Result.StandardErrorBytes)) {
+        Add-Failure (
+            'Regex timeout must return fixed redacted stderr and exit 2. ' +
+            "Exit: $($Result.ExitCode); " +
+            "stdout bytes: $($Result.StandardOutputBytes.Length); " +
+            "stderr bytes: $($Result.StandardErrorBytes.Length)."
+        )
+        return
+    }
+
+    $pathComparison = if (Test-PrivateMarkerWindowsHost) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparison]::Ordinal
+    }
+    foreach ($forbiddenPath in $ForbiddenPaths) {
+        if ([string]::IsNullOrWhiteSpace($forbiddenPath)) {
+            continue
+        }
+        foreach ($pathForm in @(
+            $forbiddenPath,
+            $forbiddenPath.Replace('\', '/'),
+            $forbiddenPath.Replace('/', '\')
+        ) | Sort-Object -Unique) {
+            if ($Result.Output.IndexOf($pathForm, $pathComparison) -ge 0) {
+                Add-Failure 'Regex timeout leaked an absolute boundary path.'
+                return
+            }
+        }
     }
 }
 
@@ -1235,6 +1285,71 @@ Add-Type `
         $overlongLineResult.Output -notmatch 'overlong line' -or
         $overlongLineResult.Output.Length -gt 16384) {
         Add-Failure "Expected an overlong line to fail before unbounded line scanning. Output: $($overlongLineResult.Output.Trim())"
+    }
+
+    # 上限近傍でもregex開始候補を持たない安全な単一行はtimeout扱いにしない。
+    # adversarial negativeだけでなく、false-positive側の対照も同じprocess境界で固定する。
+    $regexSafeNearLimitRoot = Join-Path $tempRoot 'regex-safe-near-limit'
+    New-Item -ItemType Directory -Path $regexSafeNearLimitRoot | Out-Null
+    $regexSafeNearLimitPath =
+        Join-Path $regexSafeNearLimitRoot 'safe-near-limit.txt'
+    [System.IO.File]::WriteAllText(
+        $regexSafeNearLimitPath,
+        [string]::new([char]' ', 900000),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $regexSafeNearLimitClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $regexSafeNearLimitResult = Invoke-Scanner `
+        -ScanPath $regexSafeNearLimitRoot `
+        -EnvironmentOverrides @{ PATH = $emptyCommandPath }
+    $regexSafeNearLimitClock.Stop()
+    if ($regexSafeNearLimitResult.ExitCode -ne 0 -or
+        $regexSafeNearLimitResult.TimedOut -or
+        -not $regexSafeNearLimitResult.StreamsCompleted -or
+        -not $regexSafeNearLimitResult.TreeStopped -or
+        $regexSafeNearLimitResult.Output -notmatch
+            'Private marker scan passed' -or
+        $regexSafeNearLimitClock.ElapsedMilliseconds -gt 10000) {
+        Add-Failure (
+            'Expected a safe near-limit line to pass inside the scanner ' +
+            "boundary. Elapsed: " +
+            "$($regexSafeNearLimitClock.ElapsedMilliseconds) ms."
+        )
+    }
+
+    # 1MiB line上限を下回るno-matchでも、email regexは開始位置ごとの再走査で
+    # scan-wide budgetを占有できる。regex自身の有限timeoutと固定診断を実測する。
+    $regexTimeoutRoot = Join-Path $tempRoot 'regex-match-timeout'
+    New-Item -ItemType Directory -Path $regexTimeoutRoot | Out-Null
+    $regexTimeoutPath = Join-Path $regexTimeoutRoot 'adversarial.txt'
+    [System.IO.File]::WriteAllText(
+        $regexTimeoutPath,
+        ('a.' * 500000),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $regexTimeoutClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $regexTimeoutResult = Invoke-Scanner `
+        -ScanPath $regexTimeoutRoot `
+        -EnvironmentOverrides @{ PATH = $emptyCommandPath }
+    $regexTimeoutClock.Stop()
+    Assert-FixedRegexTimeoutFailure `
+        -Result $regexTimeoutResult `
+        -ForbiddenPaths @(
+            $root,
+            $tempRoot,
+            $regexTimeoutRoot,
+            $regexTimeoutPath,
+            $scanner,
+            $processBoundary
+        )
+    if ($regexTimeoutResult.TimedOut -or
+        -not $regexTimeoutResult.StreamsCompleted -or
+        -not $regexTimeoutResult.TreeStopped -or
+        $regexTimeoutClock.ElapsedMilliseconds -gt 10000) {
+        Add-Failure (
+            'Expected adversarial regex no-match to fail inside the scanner ' +
+            "boundary. Elapsed: $($regexTimeoutClock.ElapsedMilliseconds) ms."
+        )
     }
 
     # finding は file 単位と scan 全体の双方で上限を持つ。
