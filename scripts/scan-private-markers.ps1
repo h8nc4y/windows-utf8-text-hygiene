@@ -55,6 +55,15 @@ function ConvertTo-PrivateMarkerDiagnosticText {
     return $builder.ToString()
 }
 
+function Stop-PrivateMarkerRegexTimeout {
+    # RegexMatchTimeoutExceptionをそのまま出すとPowerShell framingにscript pathが
+    # 混ざり得る。input/pattern/exceptionを再掲せず、固定ASCII 1行へ畳む。
+    [Console]::Error.WriteLine(
+        'Private marker scan failed closed (integrity: regex-timeout).'
+    )
+    exit 2
+}
+
 $scriptRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -89,6 +98,59 @@ if (-not (Test-Path -LiteralPath $processBoundary -PathType Leaf)) {
 # intentionally cross-links. Any other GitHub URL is a finding.
 $allowedRepoUrlPattern = '^https://github\.com/h8nc4y/(?:windows-utf8-text-hygiene|claude-code-devlog-hooks|windows-github-auth-diagnosis|isolated-worktree-pr-flow)(?:\.git)?$'
 
+$maximumScanMilliseconds = 120000
+$scanClock = [System.Diagnostics.Stopwatch]::StartNew()
+$maximumRegexMatchMilliseconds = 250
+$regexMatchTimeoutMilliseconds = [Math]::Max(
+    1,
+    [Math]::Min(
+        $maximumRegexMatchMilliseconds,
+        $maximumScanMilliseconds
+    )
+)
+$regexMatchTimeout = [TimeSpan]::FromMilliseconds(
+    $regexMatchTimeoutMilliseconds
+)
+
+function New-PrivateMarkerBoundedRegex {
+    param(
+        [string]$Pattern,
+        [System.Text.RegularExpressions.RegexOptions]$Options
+    )
+
+    # .NET 4.5 / Windows PowerShell 5.1互換の3引数constructorで、
+    # scan-wide checkが介入できない単一Match/IsMatchにも有限上限を持たせる。
+    return [regex]::new(
+        $Pattern,
+        $Options,
+        $regexMatchTimeout
+    )
+}
+
+# Gitやpathの構造検証もcandidate ruleと同じ有限timeoutを共有する。
+# PowerShellの`-match`/`-split`や2引数static Matchへ戻すと既定timeoutが無限に
+# なるため、regexが必要な構造判定はすべてこのobject群へ固定する。
+$internalRegexOptions =
+    [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+$gitNotRepositoryErrorMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern '(?m)^fatal: not a git repository\b' `
+    -Options $internalRegexOptions
+$gitRawDiffHeaderMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern '^:(?<oldMode>[0-9]{6}) (?<newMode>[0-9]{6}) (?<oldOid>[0-9a-f]{40}|[0-9a-f]{64}) (?<newOid>[0-9a-f]{40}|[0-9a-f]{64}) (?<status>[A-Z])(?<score>[0-9]{0,3})$' `
+    -Options $internalRegexOptions
+$gitIndexEntryMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern '(?s)^(?<mode>[0-9]{6}) (?<oid>[0-9a-f]{40}|[0-9a-f]{64}) (?<stage>[0-3])\t(?<path>.+)$' `
+    -Options $internalRegexOptions
+$allZeroOidMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern '^0+$' `
+    -Options $internalRegexOptions
+$controlCharacterMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern '[\x00-\x1F\x7F]' `
+    -Options $internalRegexOptions
+$gitBatchHeaderMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern '^(?<oid>[0-9a-fA-F]{40}|[0-9a-fA-F]{64}) blob (?<size>0|[1-9][0-9]*)$' `
+    -Options $internalRegexOptions
+
 $maximumScanRules = 256
 $maximumRulePatternCharacters = 4096
 $rules = New-Object System.Collections.Generic.List[object]
@@ -120,22 +182,24 @@ function Add-ScanRule {
         Kind = $Kind
         Allowlist = $Allowlist
         Matcher = if ($Kind -eq 'regex') {
-            [regex]::new(
-                $Pattern,
-                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+            New-PrivateMarkerBoundedRegex `
+                -Pattern $Pattern `
+                -Options (
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
                     [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
-            )
+                )
         } else {
             $null
         }
         AllowlistMatcher = if ([string]::IsNullOrEmpty($Allowlist)) {
             $null
         } else {
-            [regex]::new(
-                $Allowlist,
-                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+            New-PrivateMarkerBoundedRegex `
+                -Pattern $Allowlist `
+                -Options (
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
                     [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
-            )
+                )
         }
     }) | Out-Null
 }
@@ -195,16 +259,18 @@ function Add-LocalMarker {
 $localMarkerFile = Join-Path $root '.private-markers.local'
 
 $githubUrlPattern = 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?'
-$githubUrlMatcher = [regex]::new(
-    $githubUrlPattern,
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+$githubUrlMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern $githubUrlPattern `
+    -Options (
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
         [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
-)
-$allowedRepoUrlMatcher = [regex]::new(
-    $allowedRepoUrlPattern,
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+    )
+$allowedRepoUrlMatcher = New-PrivateMarkerBoundedRegex `
+    -Pattern $allowedRepoUrlPattern `
+    -Options (
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
         [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
-)
+    )
 $findings = New-Object System.Collections.Generic.List[object]
 
 # Binary noiseを避けつつ、secretを含みやすい拡張子と名前を明示的に含める。
@@ -283,8 +349,6 @@ $maximumTotalScannedLines = 500000
 $maximumMatchesPerRulePerLine = 256
 $maximumFindingsPerFile = 64
 $maximumTotalFindings = 512
-$maximumScanMilliseconds = 120000
-$scanClock = [System.Diagnostics.Stopwatch]::StartNew()
 $totalTextBytes = 0L
 $totalScannedLines = 0L
 $scanTargets = New-Object System.Collections.Generic.List[object]
@@ -325,6 +389,12 @@ $gitIndexDebugArguments = @(
     '--debug',
     '--'
 )
+
+function Assert-PrivateMarkerScanDeadline {
+    if ($scanClock.ElapsedMilliseconds -gt $maximumScanMilliseconds) {
+        throw 'Private marker scan exceeded its overall time budget.'
+    }
+}
 
 function Add-BoundedFinding {
     param(
@@ -368,6 +438,7 @@ function Invoke-BoundedLineAction {
     $offset = 0
     $lineNumber = 1
     while ($true) {
+        Assert-PrivateMarkerScanDeadline
         if ($lineNumber -gt $maximumLinesPerTarget) {
             throw "Text scan target exceeded its line-count limit: $Context."
         }
@@ -396,7 +467,9 @@ function Invoke-BoundedLineAction {
         }
 
         $line = $Content.Substring($offset, $lineLength)
-        & $Action $line $lineNumber
+        # 動的command invocation (`& $name`) はAST gateから実体を隠せる。
+        # 既知のScriptBlock objectを直接呼び、戻り値はscanner出力へ流さない。
+        $null = $Action.Invoke($line, $lineNumber)
         if ($lineEnd -lt 0) {
             break
         }
@@ -415,6 +488,7 @@ function Invoke-BoundedLineAction {
 }
 
 function Get-RemainingGitTimeoutMilliseconds {
+    Assert-PrivateMarkerScanDeadline
     $remaining = $maximumScanMilliseconds - [int]$scanClock.ElapsedMilliseconds
     if ($remaining -le 0) {
         throw 'Private marker scan exceeded its overall Git time budget.'
@@ -538,9 +612,17 @@ function Test-SafeWorktreeParentChain {
         throw 'Explicit scan root must remain a directory.'
     }
 
-    $components = @($RelativePath -split '/')
+    # path separatorはregexでなくliteral charとして分割し、timeout無しの
+    # PowerShell `-split`をproduction pathへ持ち込まない。
+    $components = @(
+        $RelativePath.Split(
+            [char[]]@([char]47),
+            [System.StringSplitOptions]::None
+        )
+    )
     $currentPath = $canonicalRoot
     for ($componentIndex = 0; $componentIndex -lt $components.Count - 1; $componentIndex++) {
+        Assert-PrivateMarkerScanDeadline
         $currentPath = Join-Path $currentPath $components[$componentIndex]
         try {
             $parentItem = Get-Item `
@@ -811,6 +893,7 @@ if ($null -eq $gitExe) {
         [System.IO.Path]::GetTempPath()
     ) ("windows-utf8-text-hygiene-git-" + [System.Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $gitIsolationRoot | Out-Null
+    $gitPreparationRegexTimedOut = $false
     try {
         $rootProbe = Invoke-ScannerGit `
             -Arguments @('-C', $canonicalRoot, 'rev-parse', '--show-toplevel') `
@@ -826,7 +909,7 @@ if ($null -eq $gitExe) {
                 -Context 'Git root probe stderr'
             $explicitNotRepository = $rootProbe.ExitCode -eq 128 -and
                 -not (Test-GitMarkerInAncestry) -and
-                $rootError -match '(?m)^fatal: not a git repository\b'
+                $gitNotRepositoryErrorMatcher.IsMatch($rootError)
             if (-not $explicitNotRepository) {
                 throw "Git root probe failed closed with exit code $($rootProbe.ExitCode)."
             }
@@ -846,7 +929,10 @@ if ($null -eq $gitExe) {
                 -Bytes $rootProbe.StandardOutputBytes `
                 -Context 'Git root probe stdout'
             $reportedRootLines = @(
-                $reportedRootText -split '\r?\n' |
+                $reportedRootText.Split(
+                    [char[]]@([char]13, [char]10),
+                    [System.StringSplitOptions]::RemoveEmptyEntries
+                ) |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
             )
             if ($reportedRootLines.Count -ne 1) {
@@ -903,15 +989,20 @@ if ($null -eq $gitExe) {
             }
             $rawDiffParts = @(
                 if ($rawDiffText.Length -gt 0) {
-                    $rawDiffText.Substring(0, $rawDiffText.Length - 1) -split "`0"
+                    $rawDiffText.Substring(
+                        0,
+                        $rawDiffText.Length - 1
+                    ).Split(
+                        [char[]]@([char]0),
+                        [System.StringSplitOptions]::None
+                    )
                 }
             )
             $rawIndex = 0
             while ($rawIndex -lt $rawDiffParts.Count) {
-                $header = [regex]::Match(
-                    $rawDiffParts[$rawIndex],
-                    '^:(?<oldMode>[0-9]{6}) (?<newMode>[0-9]{6}) (?<oldOid>[0-9a-f]{40}|[0-9a-f]{64}) (?<newOid>[0-9a-f]{40}|[0-9a-f]{64}) (?<status>[A-Z])(?<score>[0-9]{0,3})$'
-                )
+                Assert-PrivateMarkerScanDeadline
+                $header =
+                    $gitRawDiffHeaderMatcher.Match($rawDiffParts[$rawIndex])
                 if (-not $header.Success) {
                     throw 'Git worktree/index diff returned a malformed header.'
                 }
@@ -938,7 +1029,13 @@ if ($null -eq $gitExe) {
 
             $records = @(
                 if ($indexText.Length -gt 0) {
-                    $indexText.Substring(0, $indexText.Length - 1) -split "`0"
+                    $indexText.Substring(
+                        0,
+                        $indexText.Length - 1
+                    ).Split(
+                        [char[]]@([char]0),
+                        [System.StringSplitOptions]::None
+                    )
                 }
             )
             if ($records.Count -gt $maximumTrackedEntries) {
@@ -957,14 +1054,15 @@ if ($null -eq $gitExe) {
             $indexDebugText = ConvertFrom-PrivateMarkerUtf8Bytes `
                 -Bytes $indexDebugProbe.StandardOutputBytes `
                 -Context 'Git index metadata enumeration'
-            $debugBlockPattern = [regex]::new(
-                '\G  ctime: [0-9]{1,20}:[0-9]{1,10}\n' +
-                '  mtime: [0-9]{1,20}:[0-9]{1,10}\n' +
-                '  dev: [0-9]{1,20}\tino: [0-9]{1,20}\n' +
-                '  uid: [0-9]{1,20}\tgid: [0-9]{1,20}\n' +
-                '  size: [0-9]{1,20}\tflags: (?<flags>[0-9a-fA-F]{1,16})\n',
-                [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
-            )
+            $debugBlockPattern = New-PrivateMarkerBoundedRegex `
+                -Pattern (
+                    '\G  ctime: [0-9]{1,20}:[0-9]{1,10}\n' +
+                    '  mtime: [0-9]{1,20}:[0-9]{1,10}\n' +
+                    '  dev: [0-9]{1,20}\tino: [0-9]{1,20}\n' +
+                    '  uid: [0-9]{1,20}\tgid: [0-9]{1,20}\n' +
+                    '  size: [0-9]{1,20}\tflags: (?<flags>[0-9a-fA-F]{1,16})\n'
+                ) `
+                -Options $internalRegexOptions
             $debugOffset = 0
             foreach ($record in $records) {
                 $expectedPrefix = "$record`0"
@@ -1023,10 +1121,8 @@ if ($null -eq $gitExe) {
             )
             $indexEntries = New-Object System.Collections.Generic.List[object]
             foreach ($record in $records) {
-                $parsed = [regex]::Match(
-                    $record,
-                    '(?s)^(?<mode>[0-9]{6}) (?<oid>[0-9a-f]{40}|[0-9a-f]{64}) (?<stage>[0-3])\t(?<path>.+)$'
-                )
+                Assert-PrivateMarkerScanDeadline
+                $parsed = $gitIndexEntryMatcher.Match($record)
                 if (-not $parsed.Success) {
                     throw 'Git index enumeration returned a malformed record.'
                 }
@@ -1042,11 +1138,11 @@ if ($null -eq $gitExe) {
                 if ($mode -notin @('100644', '100755')) {
                     throw "Git index contains a symlink, gitlink, or unsupported mode: $safeRelative."
                 }
-                if ($oid -match '^0+$') {
+                if ($allZeroOidMatcher.IsMatch($oid)) {
                     throw "Git index contains an intent-to-add entry: $safeRelative."
                 }
                 if ([string]::IsNullOrWhiteSpace($relative) -or
-                    $relative -match '[\x00-\x1F\x7F]' -or
+                    $controlCharacterMatcher.IsMatch($relative) -or
                     [System.IO.Path]::IsPathRooted($relative) -or
                     -not $seenPaths.Add($relative)) {
                     throw 'Git index contains an unsafe or duplicate path.'
@@ -1169,10 +1265,9 @@ if ($null -eq $gitExe) {
                         $batchOffset,
                         $headerEnd - $batchOffset
                     )
-                    $batchHeaderMatch = [regex]::Match(
-                        $batchHeader,
-                        '^(?<oid>[0-9a-fA-F]{40}|[0-9a-fA-F]{64}) blob (?<size>0|[1-9][0-9]*)$'
-                    )
+                    Assert-PrivateMarkerScanDeadline
+                    $batchHeaderMatch =
+                        $gitBatchHeaderMatcher.Match($batchHeader)
                     if (-not $batchHeaderMatch.Success -or
                         -not $batchHeaderMatch.Groups['oid'].Value.Equals(
                             $expectedOid,
@@ -1251,6 +1346,11 @@ if ($null -eq $gitExe) {
             $scanMode = 'git-tracked'
         }
     }
+    catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
+        # cleanupより前には出力せず、正常回収後に固定診断を1行だけ返す。
+        # cleanup/boundary integrity failureが競合した場合は、そちらを優先する。
+        $gitPreparationRegexTimedOut = $true
+    }
     finally {
         $changedEnvironmentNames = @(
             Get-ChangedEnvironmentVariableNames -Expected $environmentBeforeGit
@@ -1267,11 +1367,16 @@ if ($null -eq $gitExe) {
         }
         throw "Hermetic Git boundary changed scanner environment variables: $($changedEnvironmentNames -join ', ')."
     }
+    if ($gitPreparationRegexTimedOut) {
+        Stop-PrivateMarkerRegexTimeout
+    }
 }
 
 $finalGitEnvironmentChanges = @()
+$finalRegexTimedOut = $false
 try {
     foreach ($target in $scanTargets) {
+        Assert-PrivateMarkerScanDeadline
         Invoke-BoundedLineAction `
             -Content $target.Content `
             -Context "$($target.File) ($($target.Source))" `
@@ -1282,6 +1387,7 @@ try {
                 $urlMatchCount = 0
                 $urlMatch = $githubUrlMatcher.Match($line)
                 while ($urlMatch.Success) {
+                    Assert-PrivateMarkerScanDeadline
                     $urlMatchCount++
                     if ($urlMatchCount -gt $maximumMatchesPerRulePerLine) {
                         throw 'Private marker scan exceeded its per-line URL match limit.'
@@ -1294,10 +1400,12 @@ try {
                             -Rule 'non-allowlisted-github-repo-url'
                         break
                     }
+                    Assert-PrivateMarkerScanDeadline
                     $urlMatch = $urlMatch.NextMatch()
                 }
 
                 foreach ($rule in $rules) {
+                    Assert-PrivateMarkerScanDeadline
                     $matched = $false
                     if ($rule.Kind -eq 'literal') {
                         $matched = $line.Contains($rule.Pattern)
@@ -1308,6 +1416,7 @@ try {
                         $ruleMatchCount = 0
                         $ruleMatch = $rule.Matcher.Match($line)
                         while ($ruleMatch.Success) {
+                            Assert-PrivateMarkerScanDeadline
                             $ruleMatchCount++
                             if ($ruleMatchCount -gt $maximumMatchesPerRulePerLine) {
                                 throw 'Private marker scan exceeded its per-line rule match limit.'
@@ -1318,6 +1427,7 @@ try {
                                 $matched = $true
                                 break
                             }
+                            Assert-PrivateMarkerScanDeadline
                             $ruleMatch = $ruleMatch.NextMatch()
                         }
                     }
@@ -1360,6 +1470,11 @@ try {
         }
     }
 }
+catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
+    # 正常なGit isolation cleanupまでdiagnosticを遅延する。cleanup/boundary
+    # integrity failureが競合した場合は、regex timeoutへ誤分類せず優先する。
+    $finalRegexTimedOut = $true
+}
 finally {
     if ($verifyGitIndexAtScanEnd) {
         $finalGitEnvironmentChanges = @(
@@ -1372,6 +1487,9 @@ finally {
 }
 if ($finalGitEnvironmentChanges.Count -gt 0) {
     throw "Hermetic Git boundary changed scanner environment variables: $($finalGitEnvironmentChanges -join ', ')."
+}
+if ($finalRegexTimedOut) {
+    Stop-PrivateMarkerRegexTimeout
 }
 
 if ($findings.Count -gt 0) {
