@@ -12,6 +12,11 @@ The format loosely follows Keep a Changelog conventions.
   session fallback. macOS execution remains unverified until the new
   pull-request job completes successfully; Windows PowerShell 5.1 remains a
   separate Windows-only contract.
+- Kept Git worktree-root validation fail closed without comparing absolute
+  path spellings. A bounded `--show-toplevel` probe still proves worktree
+  context, while raw `--show-prefix` output must be exactly LF or CRLF to
+  distinguish the root from a subdirectory and accept macOS physical aliases
+  such as `/var` and `/private/var`.
 - Made POSIX containment evidence fail closed on the observed session gate,
   target exit code, descendant start, and descendant cleanup. Native
   `setsid(2)` and `kill(2)` imports continue to use the POSIX runtime's

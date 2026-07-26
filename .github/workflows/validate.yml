@@ -89,6 +89,7 @@ jobs:
           if ($PSVersionTable.PSVersion.Major -ne 7) {
             throw 'Expected PowerShell 7.'
           }
+          Write-Host "macOS compatibility canary: pwsh=$($PSVersionTable.PSVersion); edition=Core."
 
       - name: Validate OSS readiness
         shell: pwsh

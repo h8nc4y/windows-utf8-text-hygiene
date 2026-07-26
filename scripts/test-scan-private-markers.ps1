@@ -1048,6 +1048,55 @@ public static class SyntheticGitProgram
             return Run(realGit, args, 20000);
         }
 
+        if (String.Equals(
+            Environment.GetEnvironmentVariable("PRIVATE_MARKER_SYNTHETIC_GIT_MODE"),
+            "root-alias",
+            StringComparison.Ordinal))
+        {
+            var realGit = Environment.GetEnvironmentVariable("PRIVATE_MARKER_REAL_GIT");
+            if (Array.IndexOf(args, "rev-parse") >= 0 &&
+                Array.IndexOf(args, "--show-toplevel") >= 0)
+            {
+                Console.Out.WriteLine(
+                    Environment.GetEnvironmentVariable("PRIVATE_MARKER_ROOT_ALIAS"));
+                return 0;
+            }
+            return Run(realGit, args, 20000);
+        }
+
+        if (String.Equals(
+            Environment.GetEnvironmentVariable("PRIVATE_MARKER_SYNTHETIC_GIT_MODE"),
+            "whitespace-prefix",
+            StringComparison.Ordinal))
+        {
+            var realGit = Environment.GetEnvironmentVariable("PRIVATE_MARKER_REAL_GIT");
+            if (Array.IndexOf(args, "rev-parse") >= 0 &&
+                Array.IndexOf(args, "--show-prefix") >= 0)
+            {
+                Console.Out.WriteLine("\u2003");
+                return 0;
+            }
+            return Run(realGit, args, 20000);
+        }
+
+        if (String.Equals(
+            Environment.GetEnvironmentVariable("PRIVATE_MARKER_SYNTHETIC_GIT_MODE"),
+            "bom-prefix",
+            StringComparison.Ordinal))
+        {
+            var realGit = Environment.GetEnvironmentVariable("PRIVATE_MARKER_REAL_GIT");
+            if (Array.IndexOf(args, "rev-parse") >= 0 &&
+                Array.IndexOf(args, "--show-prefix") >= 0)
+            {
+                var output = Console.OpenStandardOutput();
+                var bytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x0A };
+                output.Write(bytes, 0, bytes.Length);
+                output.Flush();
+                return 0;
+            }
+            return Run(realGit, args, 20000);
+        }
+
         Thread.Sleep(5000);
         File.WriteAllText(
             Environment.GetEnvironmentVariable("PRIVATE_MARKER_SLOW_GIT_SENTINEL"),
@@ -1676,8 +1725,87 @@ Add-Type `
         Add-Failure "Expected bounded target git init to succeed. Output: $($targetInit.Output.Trim())"
     }
 
+    # --show-prefix 単独では Git 管理 directory でも空を返せるため、
+    # 先行する --show-toplevel の worktree 証明を削除できないよう固定する。
+    $gitDirectoryResult = Invoke-Scanner `
+        -ScanPath (Join-Path $trackedRoot '.git')
+    if ($gitDirectoryResult.ExitCode -eq 0 -or
+        $gitDirectoryResult.Output -notmatch 'Git root probe failed closed') {
+        Add-Failure "Expected a Git administrative directory scan to fail closed. Output: $($gitDirectoryResult.Output.Trim())"
+    }
+
+    # Unicode 空白だけの directory 名も worktree root ではない。prefix の
+    # Trim / whitespace 許容へ退行して部分 scan を通さない。
+    $unicodeWhitespaceDirectory = Join-Path $trackedRoot ([string][char]0x2003)
+    New-Item -ItemType Directory -Path $unicodeWhitespaceDirectory | Out-Null
+    Set-Content `
+        -LiteralPath (Join-Path $unicodeWhitespaceDirectory 'clean.md') `
+        -Value 'synthetic clean Unicode whitespace subdirectory' `
+        -Encoding UTF8
+    $unicodeWhitespaceAdd = Invoke-HermeticGit `
+        -WorkingDirectory $trackedRoot `
+        -Arguments @('add', '--', ([string][char]0x2003 + '/clean.md')) `
+        -IsolationRoot $fixtureIsolationRoot
+    if ($unicodeWhitespaceAdd.ExitCode -ne 0) {
+        Add-Failure "Expected Unicode whitespace subdirectory setup to succeed. Output: $($unicodeWhitespaceAdd.Output.Trim())"
+    } else {
+        $unicodeWhitespaceResult = Invoke-Scanner `
+            -ScanPath $unicodeWhitespaceDirectory
+        if ($unicodeWhitespaceResult.ExitCode -eq 0 -or
+            $unicodeWhitespaceResult.Output -notmatch 'exact Git worktree root') {
+            Add-Failure "Expected a Unicode whitespace Git subdirectory scan to fail closed. Output: $($unicodeWhitespaceResult.Output.Trim())"
+        }
+    }
+
     if ((Test-PrivateMarkerWindowsHost) -and
         (Test-Path -LiteralPath $syntheticGitPath -PathType Leaf)) {
+        # macOS の /var と /private/var のように、Git が同じ worktree root を
+        # 別の物理 path 表記で返しても、文字列比較で subdirectory と誤判定しない。
+        $rootAliasResult = Invoke-Scanner `
+            -ScanPath $trackedRoot `
+            -EnvironmentOverrides @{
+                PATH = $syntheticGitDirectory
+                PRIVATE_MARKER_SYNTHETIC_GIT_MODE = 'root-alias'
+                PRIVATE_MARKER_REAL_GIT = (Get-Command git -ErrorAction Stop).Source
+                PRIVATE_MARKER_ROOT_ALIAS = (Join-Path $tempRoot 'reported root alias')
+            }
+        if ($rootAliasResult.ExitCode -ne 0 -or
+            -not $rootAliasResult.StreamsCompleted -or
+            -not $rootAliasResult.TreeStopped -or
+            $rootAliasResult.TimedOut -or
+            $rootAliasResult.OutputLimitExceeded -or
+            $rootAliasResult.PipeLeakDetected) {
+            Add-Failure "Expected a Git-reported physical root alias to remain accepted. Output: $($rootAliasResult.Output.Trim())"
+        }
+
+        # Prefix が Unicode 空白だけという不正応答も exact root とみなさない。
+        # strict な LF / CRLF 比較を Trim / IsNullOrWhiteSpace へ弱める退行を検出する。
+        $whitespacePrefixResult = Invoke-Scanner `
+            -ScanPath $trackedRoot `
+            -EnvironmentOverrides @{
+                PATH = $syntheticGitDirectory
+                PRIVATE_MARKER_SYNTHETIC_GIT_MODE = 'whitespace-prefix'
+                PRIVATE_MARKER_REAL_GIT = (Get-Command git -ErrorAction Stop).Source
+            }
+        if ($whitespacePrefixResult.ExitCode -eq 0 -or
+            $whitespacePrefixResult.Output -notmatch 'exact Git worktree root') {
+            Add-Failure "Expected a whitespace-only Git prefix to fail closed. Output: $($whitespacePrefixResult.Output.Trim())"
+        }
+
+        # UTF-8 decoder が BOM を除去しても、Git の raw prefix contract では
+        # BOM + LF を root の LF と同一視しない。
+        $bomPrefixResult = Invoke-Scanner `
+            -ScanPath $trackedRoot `
+            -EnvironmentOverrides @{
+                PATH = $syntheticGitDirectory
+                PRIVATE_MARKER_SYNTHETIC_GIT_MODE = 'bom-prefix'
+                PRIVATE_MARKER_REAL_GIT = (Get-Command git -ErrorAction Stop).Source
+            }
+        if ($bomPrefixResult.ExitCode -eq 0 -or
+            $bomPrefixResult.Output -notmatch 'exact Git worktree root') {
+            Add-Failure "Expected a BOM-prefixed Git prefix to fail closed. Output: $($bomPrefixResult.Output.Trim())"
+        }
+
         # final raw stage listing の直前に、実 index へ replacement と addition を
         # 同時適用し、開始 snapshot との差分を fail-closed で検出する。
         $indexMutationRoot = Join-Path $tempRoot 'index mutation target'

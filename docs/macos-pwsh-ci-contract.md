@@ -54,6 +54,16 @@ success merely because the direct child already exited.
 
 Success on one platform does not substitute for another platform's job.
 
+The scanner must not compare PowerShell's absolute root spelling with Git's
+`--show-toplevel` text. On macOS the same physical directory can appear under
+`/var` and `/private/var`. The bounded `--show-toplevel` probe still proves
+that the target is a worktree, then a second bounded `--show-prefix` probe must
+return only LF or CRLF to prove that `-C` is at the exact root. Any prefix,
+BOM-prefixed newline, Unicode whitespace, malformed UTF-8, output-limit
+breach, timeout, unhealthy process boundary, Git administrative directory, or
+normal subdirectory fails closed with fixed diagnostics. Both probes use the
+existing sanitized Git environment and shared scanner deadline.
+
 ## Exact Job Contract
 
 The `validate-macos` job must:
@@ -61,7 +71,8 @@ The `validate-macos` job must:
 1. use the standard `macos-15` runner;
 2. have a ten-minute job timeout;
 3. use the pinned repository checkout revision already used by other jobs;
-4. prove that the host is macOS and the shell is PowerShell Core 7;
+4. prove that the host is macOS and the shell is PowerShell Core 7, then emit
+   the measured PowerShell version in a fixed, path-free canary;
 5. run OSS readiness validation;
 6. run the complete synthetic private-marker self-test with `pwsh`;
 7. run the repository's private-marker scan; and

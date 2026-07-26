@@ -467,6 +467,335 @@ function Assert-PosixContainmentEvidenceValidatorRegressions {
     }
 }
 
+function Test-ScannerGitExactRootContract {
+    param(
+        [string]$ScannerSource,
+        [string]$SelfTestSource
+    )
+
+    $rawPrefixBlock = @(
+        '            $reportedPrefixBytes = [byte[]]@(',
+        '                $exactRootProbe.StandardOutputBytes',
+        '            )',
+        '            $isLfOnlyPrefix =',
+        '                $reportedPrefixBytes.Length -eq 1 -and',
+        '                $reportedPrefixBytes[0] -eq [byte]0x0A',
+        '            $isCrLfOnlyPrefix =',
+        '                $reportedPrefixBytes.Length -eq 2 -and',
+        '                $reportedPrefixBytes[0] -eq [byte]0x0D -and',
+        '                $reportedPrefixBytes[1] -eq [byte]0x0A',
+        '            if (-not ($isLfOnlyPrefix -or $isCrLfOnlyPrefix)) {'
+    ) -join "`n"
+    $scannerFragments = @(
+        @{ Text = '$rootProbe = Invoke-ScannerGit'; Count = 1 },
+        @{
+            Text = '-Arguments @(''-C'', $canonicalRoot, ''rev-parse'', ''--show-toplevel'')'
+            Count = 1
+        },
+        @{ Text = '-Result $rootProbe'; Count = 1 },
+        @{ Text = '$exactRootProbe = Invoke-ScannerGit'; Count = 1 },
+        @{
+            Text = '-Arguments @(''-C'', $canonicalRoot, ''rev-parse'', ''--show-prefix'')'
+            Count = 1
+        },
+        @{ Text = '-MaximumStandardOutputBytes 4096'; Count = 1 },
+        @{ Text = '-Result $exactRootProbe'; Count = 1 },
+        @{ Text = $rawPrefixBlock; Count = 1 },
+        @{
+            Text = "throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'"
+            Count = 1
+        },
+        @{ Text = '$indexProbe = Invoke-ScannerGit'; Count = 1 }
+    )
+    foreach ($fragment in $scannerFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $ScannerSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+
+    # worktree 証明 -> Git-native exact-root probe -> raw byte比較 ->
+    # index 列挙の順序も固定し、dead codeへの文字列退避を受理しにくくする。
+    $orderedFragments = @(
+        '$rootProbe = Invoke-ScannerGit',
+        '-Result $rootProbe',
+        '$exactRootProbe = Invoke-ScannerGit',
+        '-Result $exactRootProbe',
+        $rawPrefixBlock,
+        "throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'",
+        '$indexProbe = Invoke-ScannerGit'
+    )
+    $previousOffset = -1
+    foreach ($fragment in $orderedFragments) {
+        $offset = $ScannerSource.IndexOf(
+            $fragment,
+            $previousOffset + 1,
+            [System.StringComparison]::Ordinal
+        )
+        if ($offset -le $previousOffset) {
+            return $false
+        }
+        $previousOffset = $offset
+    }
+
+    $rootAliasFailurePredicate = @(
+        '        if ($rootAliasResult.ExitCode -ne 0 -or',
+        '            -not $rootAliasResult.StreamsCompleted -or',
+        '            -not $rootAliasResult.TreeStopped -or',
+        '            $rootAliasResult.TimedOut -or',
+        '            $rootAliasResult.OutputLimitExceeded -or',
+        '            $rootAliasResult.PipeLeakDetected) {'
+    ) -join "`n"
+    $selfTestFragments = @(
+        @{ Text = 'PRIVATE_MARKER_ROOT_ALIAS'; Count = 2 },
+        @{
+            Text = 'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''root-alias'''
+            Count = 1
+        },
+        @{
+            Text = 'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''whitespace-prefix'''
+            Count = 1
+        },
+        @{
+            Text = 'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''bom-prefix'''
+            Count = 1
+        },
+        @{
+            Text = 'var bytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x0A };'
+            Count = 1
+        },
+        @{ Text = $rootAliasFailurePredicate; Count = 1 },
+        @{
+            Text = '$gitDirectoryResult.Output -notmatch ''Git root probe failed closed'''
+            Count = 1
+        },
+        @{
+            Text = '$unicodeWhitespaceResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        },
+        @{
+            Text = '$whitespacePrefixResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        },
+        @{
+            Text = '$bomPrefixResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        },
+        @{
+            Text = '$subdirectoryResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        }
+    )
+    foreach ($fragment in $selfTestFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $SelfTestSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+
+    $orderedSelfTestFragments = @(
+        '$rootAliasResult = Invoke-Scanner',
+        'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''root-alias''',
+        $rootAliasFailurePredicate,
+        'Add-Failure "Expected a Git-reported physical root alias to remain accepted.',
+        '$bomPrefixResult = Invoke-Scanner',
+        'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''bom-prefix''',
+        '$bomPrefixResult.Output -notmatch ''exact Git worktree root'''
+    )
+    $previousOffset = -1
+    foreach ($fragment in $orderedSelfTestFragments) {
+        $offset = $SelfTestSource.IndexOf(
+            $fragment,
+            $previousOffset + 1,
+            [System.StringComparison]::Ordinal
+        )
+        if ($offset -le $previousOffset) {
+            return $false
+        }
+        $previousOffset = $offset
+    }
+    return $true
+}
+
+function Assert-ScannerGitExactRootValidatorRegressions {
+    param(
+        [string]$ScannerRelativePath,
+        [string]$SelfTestRelativePath
+    )
+
+    $scannerPath = Get-RepoFilePath -RelativePath $ScannerRelativePath
+    $selfTestPath = Get-RepoFilePath -RelativePath $SelfTestRelativePath
+    if (-not (Test-Path -LiteralPath $scannerPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $selfTestPath -PathType Leaf)) {
+        Add-Failure 'Cannot inspect missing Git exact-root contract source.'
+        return
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $scannerSource = [System.IO.File]::ReadAllText($scannerPath, $strictUtf8)
+        $selfTestSource = [System.IO.File]::ReadAllText($selfTestPath, $strictUtf8)
+    }
+    catch {
+        Add-Failure 'Git exact-root contract sources must be valid UTF-8.'
+        return
+    }
+
+    if (-not (Test-ScannerGitExactRootContract `
+            -ScannerSource $scannerSource `
+            -SelfTestSource $selfTestSource)) {
+        Add-Failure 'Git exact-root worktree proof, strict prefix check, or regressions are incomplete.'
+        return
+    }
+
+    $rawPrefixGuard =
+        'if (-not ($isLfOnlyPrefix -or $isCrLfOnlyPrefix)) {'
+    $rootAliasFailurePredicate = @(
+        '        if ($rootAliasResult.ExitCode -ne 0 -or',
+        '            -not $rootAliasResult.StreamsCompleted -or',
+        '            -not $rootAliasResult.TreeStopped -or',
+        '            $rootAliasResult.TimedOut -or',
+        '            $rootAliasResult.OutputLimitExceeded -or',
+        '            $rootAliasResult.PipeLeakDetected) {'
+    ) -join "`n"
+    $bomNormalization = @(
+        '            if ($reportedPrefixBytes.Length -ge 3 -and',
+        '                $reportedPrefixBytes[0] -eq [byte]0xEF -and',
+        '                $reportedPrefixBytes[1] -eq [byte]0xBB -and',
+        '                $reportedPrefixBytes[2] -eq [byte]0xBF) {',
+        '                $reportedPrefixBytes = $reportedPrefixBytes[3..($reportedPrefixBytes.Length - 1)]',
+        '            }',
+        '            $isLfOnlyPrefix ='
+    ) -join "`n"
+    $mutations = @(
+        [pscustomobject]@{
+            Name = 'worktree proof removal'
+            ScannerSource = $scannerSource.Replace(
+                '$rootProbe = Invoke-ScannerGit',
+                '$removedRootProbe = Invoke-ScannerGit'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'Git-native prefix probe'
+            ScannerSource = $scannerSource.Replace(
+                '''--show-prefix''',
+                '''--show-toplevel'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'exact-root healthy boundary'
+            ScannerSource = $scannerSource.Replace(
+                '-Result $exactRootProbe',
+                '-Result $rootProbe'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'strict prefix guard removal'
+            ScannerSource = $scannerSource.Replace(
+                $rawPrefixGuard,
+                'if ($false) {'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'exact-root fail-closed throw'
+            ScannerSource = $scannerSource.Replace(
+                "throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'",
+                '$null = $reportedPrefixBytes'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'LF raw byte contract'
+            ScannerSource = $scannerSource.Replace(
+                '$reportedPrefixBytes[0] -eq [byte]0x0A',
+                '$reportedPrefixBytes[0] -eq [byte]0x20'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'BOM normalization before raw comparison'
+            ScannerSource = $scannerSource.Replace(
+                '            $isLfOnlyPrefix =',
+                $bomNormalization
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'root alias regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''root-alias''',
+                'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''unchecked-root-alias'''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'vacuous root alias success predicate'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                $rootAliasFailurePredicate,
+                '        if ($false) {'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'Git administrative directory regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$gitDirectoryResult.Output -notmatch ''Git root probe failed closed''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'Unicode whitespace subdirectory regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$unicodeWhitespaceResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'whitespace-only prefix regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$whitespacePrefixResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'BOM-prefixed raw output regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$bomPrefixResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'normal subdirectory regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$subdirectoryResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if ($mutation.ScannerSource -ceq $scannerSource -and
+            $mutation.SelfTestSource -ceq $selfTestSource) {
+            Add-Failure "Git exact-root validator mutation was ineffective: $($mutation.Name)"
+            continue
+        }
+        if (Test-ScannerGitExactRootContract `
+                -ScannerSource $mutation.ScannerSource `
+                -SelfTestSource $mutation.SelfTestSource) {
+            Add-Failure "Git exact-root validator accepted mutation: $($mutation.Name)"
+        }
+    }
+}
+
 function Test-PrivateMarkerRegexTypeText {
     param([AllowNull()][object]$Text)
 
@@ -1509,6 +1838,7 @@ $expectedMacOsWorkflowJob = @'
           if ($PSVersionTable.PSVersion.Major -ne 7) {
             throw 'Expected PowerShell 7.'
           }
+          Write-Host "macOS compatibility canary: pwsh=$($PSVersionTable.PSVersion); edition=Core."
 
       - name: Validate OSS readiness
         shell: pwsh
@@ -1533,6 +1863,9 @@ Assert-WorkflowJobBlockExact `
 
 Assert-PosixContainmentEvidenceValidatorRegressions `
     -ProcessRelativePath 'scripts/private-marker-process.ps1' `
+    -SelfTestRelativePath 'scripts/test-scan-private-markers.ps1'
+Assert-ScannerGitExactRootValidatorRegressions `
+    -ScannerRelativePath 'scripts/scan-private-markers.ps1' `
     -SelfTestRelativePath 'scripts/test-scan-private-markers.ps1'
 Assert-ScannerHasOnlyBoundedRegexOperations `
     -RelativePath 'scripts/scan-private-markers.ps1'
