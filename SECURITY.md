@@ -68,8 +68,12 @@ On POSIX, the requested executable starts in a dedicated session/process
 group before its first instruction, and cleanup targets the whole group.
 Ubuntu exercises both its external `setsid` path and a forced native
 `setsid(2)` case. The macOS 15 job uses PowerShell 7 only and exercises the
-native fallback; until its pull-request run succeeds, macOS behavior remains
-unverified. The helper reports the selected POSIX gate, while the self-test
+native fallback. In
+[run 30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010),
+PowerShell Core 7.6.3 on `macos-15-arm64` reported
+`automatic=native-setsid` and `forced=native-setsid`; target exit,
+descendant-start, cleanup, the full self-test, scanner, and whitespace checks
+all passed. The helper reports the selected POSIX gate, while the self-test
 requires that report, a zero target exit, descendant-start evidence, and
 post-cleanup absence. Native `setsid(2)` and `kill(2)` calls use the POSIX
 runtime's `libc` resolver. A bounded, strict-UTF-8 status channel maps native

@@ -9,9 +9,11 @@ The format loosely follows Keep a Changelog conventions.
 ### Changed
 
 - Added a bounded `macos-15` PowerShell 7 CI contract for the native POSIX
-  session fallback. macOS execution remains unverified until the new
-  pull-request job completes successfully; Windows PowerShell 5.1 remains a
-  separate Windows-only contract.
+  session fallback. Run
+  [30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010)
+  verified PowerShell Core 7.6.3 on `macos-15-arm64` image
+  `20260715.0234.1`; Windows PowerShell 5.1 remains a separate Windows-only
+  contract.
 - Kept Git worktree-root validation fail closed without comparing absolute
   path spellings. A bounded `--show-toplevel` probe still proves worktree
   context, while raw `--show-prefix` output must be exactly LF or CRLF to

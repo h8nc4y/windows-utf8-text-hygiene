@@ -1,7 +1,6 @@
 # macOS PowerShell CI Contract
 
-Status: implemented; macOS execution remains unverified until the
-pull-request job completes successfully.
+Status: verified by pull-request run 30205393010 on 2026-07-26.
 
 ## Objective
 
@@ -89,10 +88,25 @@ shared handshake deadline. It must also reject an `$IsMacOS` assignment.
 
 ## Acceptance Evidence
 
-Before the pull-request job is green, macOS support remains `unverified`.
-After it is green, record the actual runner, PowerShell version, job result,
-and run URL in the pull request and update the public limitation wording. Local
-Windows or Linux success is not macOS evidence.
+The bounded compatibility contract passed in
+[run 30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010),
+[job 89802443609](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010/job/89802443609):
+
+- requested runner label: `macos-15`;
+- provisioned image: `macos-15-arm64`, version `20260715.0234.1`;
+- shell: PowerShell Core `7.6.3`;
+- fixed containment evidence:
+  `automatic=native-setsid; forced=native-setsid; target-exit=0;
+  descendant-started=true; descendant-stopped=true`;
+- complete synthetic self-test: passed;
+- repository private-marker scan in `git-tracked` mode: passed; and
+- committed whitespace check: passed.
+
+The Windows and Ubuntu jobs in the same run also passed. This was bounded
+correction attempt 2 for the root-alias failure class; no timeout was changed.
+The result verifies this measured runner and PowerShell version only. Local
+Windows or Linux success is not macOS evidence, and a future runner-image,
+PowerShell-version, native-resolver, or timeout change requires new evidence.
 
 For one macOS failure class, make at most three bounded correction pushes. If
 the third run still fails, stop with the fixed stage code and leave macOS

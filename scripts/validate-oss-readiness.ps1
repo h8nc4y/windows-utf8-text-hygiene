@@ -56,6 +56,25 @@ function Assert-FileContains {
     }
 }
 
+function Assert-FileDoesNotContain {
+    param(
+        [string]$RelativePath,
+        [string]$Pattern,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $filePath -Raw
+    if ($content -match $Pattern) {
+        Add-Failure "$RelativePath still contains: $Description"
+    }
+}
+
 function Assert-WorkflowJobBlockExact {
     param(
         [string]$RelativePath,
@@ -1802,10 +1821,22 @@ Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'use
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)shell:\s*powershell\s+run:\s*\.\\scripts\\test-scan-private-markers\.ps1' -Description 'explicit Windows PowerShell 5.1 scanner self-test'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)validate-ubuntu:.*runs-on:\s*ubuntu-24\.04.*test-scan-private-markers\.ps1' -Description 'Ubuntu POSIX containment self-test'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'macOS 15 job uses PowerShell 7 only' -Description 'macOS PowerShell-only platform distinction'
-Assert-FileContains -RelativePath 'README.md' -Pattern 'macOS remains unverified until' -Description 'pre-CI macOS honesty marker'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'macos-15-arm64' -Description 'measured macOS runner image'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'PowerShell Core\s+`7\.6\.3`' -Description 'measured macOS PowerShell version'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern 'Platform results are not interchangeable' -Description 'contributor platform evidence distinction'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '30205393010' -Description 'contributor macOS evidence run'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern 'macOS 15 job uses PowerShell 7 only' -Description 'security platform containment distinction'
-Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?im)^Status:.*unverified' -Description 'macOS pre-CI evidence status'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern 'automatic=native-setsid' -Description 'measured macOS automatic gate'
+Assert-FileContains -RelativePath 'CHANGELOG.md' -Pattern '30205393010' -Description 'changelog macOS evidence run'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?im)^Status:\s*verified' -Description 'verified macOS evidence status'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'macos-15-arm64.*20260715\.0234\.1' -Description 'documented macOS runner image evidence'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'PowerShell Core\s+`7\.6\.3`' -Description 'documented macOS PowerShell evidence'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'job/89802443609' -Description 'documented macOS job evidence'
+Assert-FileDoesNotContain -RelativePath 'README.md' -Pattern 'job is being added|macOS remains unverified until' -Description 'stale pre-CI macOS limitation'
+Assert-FileDoesNotContain -RelativePath 'SECURITY.md' -Pattern 'until its pull-request run succeeds|macOS behavior remains\s+unverified' -Description 'stale pre-CI macOS security limitation'
+Assert-FileDoesNotContain -RelativePath 'CONTRIBUTING.md' -Pattern 'Until that pull-request job is green' -Description 'stale pre-CI contributor limitation'
+Assert-FileDoesNotContain -RelativePath 'CHANGELOG.md' -Pattern 'macOS execution remains unverified' -Description 'stale pre-CI changelog status'
+Assert-FileDoesNotContain -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?im)^Status:.*unverified|Before the pull-request job is green' -Description 'stale pre-CI evidence status'
 Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'PosixSessionGate' -Description 'documented POSIX gate provenance'
 Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'DllImport\("libc"\)' -Description 'documented POSIX native resolver contract'
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner'

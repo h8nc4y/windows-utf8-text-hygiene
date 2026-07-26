@@ -93,8 +93,12 @@ native POSIX session fallback only; it does not provide PowerShell 5.1
 coverage. POSIX success requires the observed session gate, a zero target exit,
 and descendant start/cleanup evidence to agree with the host contract. A
 native gate failure may report only its fixed stage code; do not add raw paths
-or child output to CI diagnostics. Until that pull-request job is green, macOS
-remains unverified.
+or child output to CI diagnostics. The current measured macOS evidence is
+[run 30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010):
+PowerShell Core 7.6.3 on image `macos-15-arm64` version `20260715.0234.1`
+passed the full contract. Treat a runner-image, PowerShell-version, resolver,
+or timeout change as new evidence; do not generalize this result to an
+unmeasured environment.
 
 The scanner self-test includes a near-limit safe line and an adversarial
 one-million-character no-match line. The safe control must pass, while a
