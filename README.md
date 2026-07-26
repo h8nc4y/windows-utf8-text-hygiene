@@ -237,8 +237,13 @@ Same series — Windows agent-operations skills by the same maintainer:
 
 - The skill's commands are exercised on Windows 11 with PowerShell 7.x,
   Windows PowerShell 5.1, ripgrep, and Git Bash. The PowerShell snippets
-  target .NET APIs available in both 5.1 and 7; behavior on other
-  platforms' PowerShell installs is untested (unverified).
+  target .NET APIs available in both 5.1 and 7. The bounded
+  [macOS compatibility run](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010)
+  measured `macos-15-arm64` image `20260715.0234.1` with PowerShell Core
+  `7.6.3`: the complete self-test, private-marker scan, and whitespace check
+  passed, with both automatic and forced gates reporting `native-setsid`.
+  This evidence applies to that measured runner; Windows PowerShell 5.1
+  remains a Windows-only contract and is not substituted by the macOS job.
 - The mojibake examples are CP932 (Japanese Shift_JIS)-specific. The
   strict-decode guard itself is encoding-agnostic — any non-UTF-8 input
   throws — but the documented byte-level failure modes were measured
@@ -291,9 +296,20 @@ The GitHub Actions workflow runs the same validation, scan self-test,
 private-marker scan, and whitespace check on pull requests and pushes to
 `main`. Windows runs the self-test separately under PowerShell 7 and
 Windows PowerShell 5.1; Ubuntu 24.04 runs the PowerShell 7 self-test to
-exercise POSIX process containment. Each validation job has a finite
-timeout, and the self-test always reuses the host that started it instead
-of silently substituting `pwsh` for a 5.1 check.
+exercise both its normal external `setsid` path and the forced native
+`setsid(2)` fallback. The macOS 15 job uses PowerShell 7 only and exercises
+the native POSIX session fallback; it does not claim Windows PowerShell 5.1
+coverage. The POSIX self-test also requires the process helper to report the
+expected gate, return a zero target exit code, prove that the descendant
+started, and prove that group cleanup stopped it. Native calls bind to `libc`
+through the POSIX runtime resolver. Native gate failures expose only a fixed
+stage code (`compile`, `setsid` call, or ready handshake); paths and child
+output are not reflected. Each validation job has a finite timeout, and the
+helper uses one deadline for launch, handshake, and target execution. The
+self-test also rejects an already exited zero-code child when setup or stream
+cleanup consumes that deadline. It always reuses the host that started it
+instead of silently substituting `pwsh` for a 5.1 check. See
+[the macOS PowerShell CI contract](docs/macos-pwsh-ci-contract.md).
 
 Git-backed file enumeration is also hermetic and bounded. Each `git`
 probe receives a sanitized child-only environment, empty global/system

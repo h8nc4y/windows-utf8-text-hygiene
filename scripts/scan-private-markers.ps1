@@ -925,32 +925,28 @@ if ($null -eq $gitExe) {
                     -Bytes (Read-StableWorktreeBytes -FullPath $file.FullName -RelativePath $relative)
             }
         } else {
-            $reportedRootText = ConvertFrom-PrivateMarkerUtf8Bytes `
-                -Bytes $rootProbe.StandardOutputBytes `
-                -Context 'Git root probe stdout'
-            $reportedRootLines = @(
-                $reportedRootText.Split(
-                    [char[]]@([char]13, [char]10),
-                    [System.StringSplitOptions]::RemoveEmptyEntries
-                ) |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            # macOS では同じ physical directory が /var と /private/var のように
+            # PowerShell と Git で異なる絶対 path 表記になり得る。絶対 path の
+            # 文字列比較ではなく、Git 自身が -C の位置から返す prefix を使う。
+            # worktree root なら raw 出力は改行だけ、subdirectory なら prefix が入る。
+            # UTF-8 decode は BOM を除去し得るため、ここでは bytes を直接比較する。
+            $exactRootProbe = Invoke-ScannerGit `
+                -Arguments @('-C', $canonicalRoot, 'rev-parse', '--show-prefix') `
+                -MaximumStandardOutputBytes 4096
+            Assert-HealthyGitBoundary `
+                -Result $exactRootProbe `
+                -Context 'Git exact-root probe'
+            $reportedPrefixBytes = [byte[]]@(
+                $exactRootProbe.StandardOutputBytes
             )
-            if ($reportedRootLines.Count -ne 1) {
-                throw 'Git root probe returned malformed output.'
-            }
-            try {
-                $reportedRoot = [System.IO.Path]::GetFullPath(
-                    $reportedRootLines[0]
-                ).TrimEnd([char]92, [char]47)
-            }
-            catch {
-                throw 'Git root probe returned an invalid path.'
-            }
-            if (-not [string]::Equals(
-                $canonicalRoot,
-                $reportedRoot,
-                $pathComparison
-            )) {
+            $isLfOnlyPrefix =
+                $reportedPrefixBytes.Length -eq 1 -and
+                $reportedPrefixBytes[0] -eq [byte]0x0A
+            $isCrLfOnlyPrefix =
+                $reportedPrefixBytes.Length -eq 2 -and
+                $reportedPrefixBytes[0] -eq [byte]0x0D -and
+                $reportedPrefixBytes[1] -eq [byte]0x0A
+            if (-not ($isLfOnlyPrefix -or $isCrLfOnlyPrefix)) {
                 throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'
             }
 

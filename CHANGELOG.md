@@ -8,6 +8,31 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Added a bounded `macos-15` PowerShell 7 CI contract for the native POSIX
+  session fallback. Run
+  [30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010)
+  verified PowerShell Core 7.6.3 on `macos-15-arm64` image
+  `20260715.0234.1`; Windows PowerShell 5.1 remains a separate Windows-only
+  contract.
+- Kept Git worktree-root validation fail closed without comparing absolute
+  path spellings. A bounded `--show-toplevel` probe still proves worktree
+  context, while raw `--show-prefix` output must be exactly LF or CRLF to
+  distinguish the root from a subdirectory and accept macOS physical aliases
+  such as `/var` and `/private/var`.
+- Made the exact macOS workflow validator require the canonical top-level
+  workflow shape, canonical direct job headings, and the job block to be a
+  direct child of its `jobs:` mapping. Its mutation checks reject relocation,
+  missing headings, and alternate or duplicate root `jobs` or direct
+  `validate-macos` definitions that could replace the validated job.
+- Made POSIX containment evidence fail closed on the observed session gate,
+  target exit code, descendant start, and descendant cleanup. Native
+  `setsid(2)` and `kill(2)` imports continue to use the POSIX runtime's
+  established `libc` resolver.
+- Added bounded, allowlisted native-gate stage diagnostics and made process
+  launch, the gate handshake, and target execution share the existing caller
+  timeout. Elapsed-only pre-cleanup and final checks reject already-exited
+  zero-code children after setup or cleanup overruns. The PowerShell wrapper
+  also avoids the read-only `$IsMacOS` automatic-variable name.
 - Hardened private-marker scanning so Git file enumeration runs in bounded,
   hermetic child processes. Ambient `GIT_*`, home/config, hooks, attributes,
   excludes, templates, filters, prompts, and trace settings can no longer

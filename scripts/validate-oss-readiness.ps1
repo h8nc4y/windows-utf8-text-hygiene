@@ -56,6 +56,1004 @@ function Assert-FileContains {
     }
 }
 
+function Assert-FileDoesNotContain {
+    param(
+        [string]$RelativePath,
+        [string]$Pattern,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $filePath -Raw
+    if ($content -match $Pattern) {
+        Add-Failure "$RelativePath still contains: $Description"
+    }
+}
+
+function Test-WorkflowJobBlockExactContent {
+    param(
+        [string[]]$Lines,
+        [string]$JobName,
+        [string]$ExpectedBlock
+    )
+
+    # root key をcanonicalな4行だけに固定する。jobsを別表記で重複定義し、
+    # YAMLの後勝ち解釈で検証対象jobを無効化する形もfail closedにする。
+    $expectedTopLevelLines = @(
+        'name: Validate',
+        'on:',
+        'permissions:',
+        'jobs:'
+    )
+    $actualTopLevelLines = @()
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.TrimStart().StartsWith('#')) {
+            continue
+        }
+        if (-not $line.StartsWith(' ')) {
+            $actualTopLevelLines += $line
+        }
+    }
+    if ($actualTopLevelLines.Count -ne $expectedTopLevelLines.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedTopLevelLines.Count; $index++) {
+        if ($actualTopLevelLines[$index] -cne $expectedTopLevelLines[$index]) {
+            return $false
+        }
+    }
+
+    # canonical jobs mapping と job heading を各1件に固定する。block文字列が
+    # 別のtop-level mapping配下へ移されても、非実行jobを受理しない。
+    $jobsIndexes = @()
+    $heading = "  ${JobName}:"
+    $startIndexes = @()
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        if ($Lines[$index] -ceq 'jobs:') {
+            $jobsIndexes += $index
+        }
+        if ($Lines[$index] -ceq $heading) {
+            $startIndexes += $index
+        }
+    }
+    if ($jobsIndexes.Count -ne 1 -or $startIndexes.Count -ne 1) {
+        return $false
+    }
+
+    $jobsIndex = $jobsIndexes[0]
+    $jobsEndIndex = $Lines.Count - 1
+    for ($index = $jobsIndex + 1; $index -lt $Lines.Count; $index++) {
+        $line = $Lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.StartsWith('#')) {
+            continue
+        }
+        if (-not [char]::IsWhiteSpace($line[0])) {
+            $jobsEndIndex = $index - 1
+            break
+        }
+    }
+
+    # jobs mapping直下のjob IDもcanonicalな3行だけに固定する。引用符、
+    # colon前空白、explicit key等の同値な重複jobを後置して、完全一致した
+    # validate-macosをYAMLの後勝ちで無効化する形を受理しない。
+    $expectedJobHeadings = @(
+        '  validate:',
+        '  validate-ubuntu:',
+        '  validate-macos:'
+    )
+    $actualJobHeadings = @()
+    for ($index = $jobsIndex + 1; $index -le $jobsEndIndex; $index++) {
+        $line = $Lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.TrimStart().StartsWith('#')) {
+            continue
+        }
+        if (-not $line.StartsWith('  ')) {
+            return $false
+        }
+        if (-not $line.StartsWith('   ')) {
+            $actualJobHeadings += $line
+        }
+    }
+    if ($actualJobHeadings.Count -ne $expectedJobHeadings.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedJobHeadings.Count; $index++) {
+        if ($actualJobHeadings[$index] -cne $expectedJobHeadings[$index]) {
+            return $false
+        }
+    }
+
+    $startIndex = $startIndexes[0]
+    if ($startIndex -le $jobsIndex -or $startIndex -gt $jobsEndIndex) {
+        return $false
+    }
+
+    # jobs mapping 内の次の同階層job直前までを閉じた契約として比較する。
+    $endIndex = $jobsEndIndex
+    for ($index = $startIndex + 1; $index -le $jobsEndIndex; $index++) {
+        $line = $Lines[$index]
+        if ($line.StartsWith('  ') -and
+            -not $line.StartsWith('   ') -and
+            $line.EndsWith(':')) {
+            $endIndex = $index - 1
+            break
+        }
+    }
+
+    $trimCharacters = [char[]]@("`r", "`n")
+    $actualBlock = (
+        @($Lines[$startIndex..$endIndex]) -join "`n"
+    ).TrimEnd($trimCharacters)
+    $normalizedExpected = $ExpectedBlock.Replace(
+        "`r`n",
+        "`n"
+    ).TrimEnd($trimCharacters)
+    return $actualBlock -ceq $normalizedExpected
+}
+
+function Assert-WorkflowJobBlockExact {
+    param(
+        [string]$RelativePath,
+        [string]$JobName,
+        [string]$ExpectedBlock
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath (exact workflow job '$JobName')"
+        return
+    }
+
+    $lines = @(Get-Content -LiteralPath $filePath)
+    if (-not (Test-WorkflowJobBlockExactContent `
+            -Lines $lines `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock)) {
+        Add-Failure "Workflow job '$JobName' failed its exact block contract."
+    }
+}
+
+function Assert-WorkflowJobBlockValidatorRegressions {
+    param(
+        [string]$RelativePath,
+        [string]$JobName,
+        [string]$ExpectedBlock
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+
+    $lines = @(Get-Content -LiteralPath $filePath)
+    if (-not (Test-WorkflowJobBlockExactContent `
+            -Lines $lines `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock)) {
+        return
+    }
+
+    $trimCharacters = [char[]]@("`r", "`n")
+    $workflowText = ($lines -join "`n").TrimEnd($trimCharacters)
+    $normalizedExpected = $ExpectedBlock.Replace(
+        "`r`n",
+        "`n"
+    ).TrimEnd($trimCharacters)
+    $targetOffset = $workflowText.IndexOf(
+        $normalizedExpected,
+        [System.StringComparison]::Ordinal
+    )
+    $jobsMarker = "jobs:`n"
+    $jobsOffset = $workflowText.IndexOf(
+        $jobsMarker,
+        [System.StringComparison]::Ordinal
+    )
+    if ($targetOffset -lt 0 -or
+        $targetOffset -ne $workflowText.LastIndexOf(
+            $normalizedExpected,
+            [System.StringComparison]::Ordinal
+        ) -or
+        $jobsOffset -lt 0) {
+        Add-Failure 'Workflow job membership mutation fixture could not be constructed.'
+        return
+    }
+
+    $withoutTarget = $workflowText.Remove(
+        $targetOffset,
+        $normalizedExpected.Length
+    )
+    $relocatedBlock = (
+        "ignored-contract-fixture:`n" +
+        $normalizedExpected +
+        "`n  sibling-delimiter:`n`n"
+    )
+    $relocatedText = $withoutTarget.Insert($jobsOffset, $relocatedBlock)
+    $relocatedLines = $relocatedText.Split(
+        [string[]]@("`n"),
+        [System.StringSplitOptions]::None
+    )
+    if (Test-WorkflowJobBlockExactContent `
+            -Lines $relocatedLines `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock) {
+        Add-Failure 'Workflow job validator accepted a block outside top-level jobs.'
+    }
+
+    $renamedJobsText = $workflowText.Replace(
+        $jobsMarker,
+        "ignored-jobs:`n"
+    )
+    if ($renamedJobsText -ceq $workflowText) {
+        Add-Failure 'Workflow jobs-heading mutation was ineffective.'
+    } elseif (Test-WorkflowJobBlockExactContent `
+            -Lines $renamedJobsText.Split(
+                [string[]]@("`n"),
+                [System.StringSplitOptions]::None
+            ) `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock) {
+        Add-Failure 'Workflow job validator accepted a missing top-level jobs mapping.'
+    }
+
+    # YAMLで同じroot keyを表せる別構文を追加し、後勝ちで有効なjobs mappingを
+    # 空にできる形をすべて拒否する。文字列比較だけのjobs件数確認へ戻さない。
+    $alternateJobsDefinitions = @(
+        'jobs: {}',
+        'jobs : {}',
+        '"jobs": {}',
+        "'jobs': {}",
+        "? jobs`n: {}"
+    )
+    foreach ($alternateJobsDefinition in $alternateJobsDefinitions) {
+        $duplicateJobsText = (
+            $workflowText +
+            "`n" +
+            $alternateJobsDefinition
+        )
+        if ($duplicateJobsText -ceq $workflowText) {
+            Add-Failure 'Workflow duplicate-jobs mutation was ineffective.'
+            continue
+        }
+        $duplicateJobsLines = $duplicateJobsText.Split(
+            [string[]]@("`n"),
+            [System.StringSplitOptions]::None
+        )
+        if (Test-WorkflowJobBlockExactContent `
+                -Lines $duplicateJobsLines `
+                -JobName $JobName `
+                -ExpectedBlock $ExpectedBlock) {
+            Add-Failure 'Workflow job validator accepted an alternate top-level jobs definition.'
+        }
+    }
+
+    # 対象jobのcanonical block直後に同値な別表記を置く。次jobの境界として
+    # 単に除外する実装ではなく、jobs直下の見出し集合自体が拒否する必要がある。
+    $alternateTargetDefinitions = @(
+        "  ${JobName}: { if: false, runs-on: ubuntu-latest }",
+        "  ${JobName} : { if: false, runs-on: ubuntu-latest }",
+        "  `"${JobName}`":`n    if: false`n    runs-on: ubuntu-latest",
+        "  '${JobName}':`n    if: false`n    runs-on: ubuntu-latest",
+        "  ? ${JobName}`n  :`n    if: false`n    runs-on: ubuntu-latest"
+    )
+    foreach ($alternateTargetDefinition in $alternateTargetDefinitions) {
+        $duplicateTargetText = (
+            $workflowText +
+            "`n" +
+            $alternateTargetDefinition
+        )
+        if ($duplicateTargetText -ceq $workflowText) {
+            Add-Failure 'Workflow duplicate-target mutation was ineffective.'
+            continue
+        }
+        $duplicateTargetLines = $duplicateTargetText.Split(
+            [string[]]@("`n"),
+            [System.StringSplitOptions]::None
+        )
+        if (Test-WorkflowJobBlockExactContent `
+                -Lines $duplicateTargetLines `
+                -JobName $JobName `
+                -ExpectedBlock $ExpectedBlock) {
+            Add-Failure 'Workflow job validator accepted an alternate duplicate target job.'
+        }
+    }
+}
+
+function Get-OrdinalFragmentCount {
+    param(
+        [string]$Content,
+        [string]$Fragment
+    )
+
+    if ([string]::IsNullOrEmpty($Fragment)) {
+        return 0
+    }
+
+    $count = 0
+    $offset = 0
+    while ($offset -lt $Content.Length) {
+        $index = $Content.IndexOf(
+            $Fragment,
+            $offset,
+            [System.StringComparison]::Ordinal
+        )
+        if ($index -lt 0) {
+            break
+        }
+        $count++
+        $offset = $index + $Fragment.Length
+    }
+    return $count
+}
+
+function Test-PosixContainmentEvidenceContract {
+    param(
+        [string]$ProcessSource,
+        [string]$SelfTestSource
+    )
+
+    $processFragments = @(
+        @{ Text = 'PosixSessionGate = $posixSessionGate'; Count = 1 },
+        @{ Text = '$posixSessionGate = ''external-setsid'''; Count = 1 },
+        @{ Text = '$posixSessionGate = ''native-setsid'''; Count = 1 },
+        @{
+            Text = '[DllImport("libc", SetLastError = true)]'
+            Count = 2
+        },
+        @{
+            Text = 'function ConvertTo-PrivateMarkerPosixGateFailureReason'
+            Count = 1
+        },
+        @{
+            Text = 'function Read-PrivateMarkerPosixGateStatus'
+            Count = 1
+        },
+        @{
+            Text = 'Join-Path $gateRoot "private-marker-posix-status-$gateId"'
+            Count = 1
+        },
+        @{ Text = 'Write-NativeGateStatus ''compile'''; Count = 1 },
+        @{ Text = 'Write-NativeGateStatus ''setsid-call'''; Count = 2 },
+        @{ Text = 'Write-NativeGateStatus ''ready-prepare'''; Count = 1 },
+        @{ Text = 'Write-NativeGateStatus ''ready-write'''; Count = 1 },
+        @{ Text = '-Path $posixGateStatusPath'; Count = 1 },
+        @{ Text = '-Status $posixGateStatus'; Count = 1 },
+        @{ Text = '[PrivateMarker.NativePosixSession]::Create()'; Count = 1 },
+        @{ Text = 'New-Object byte[] 65'; Count = 1 },
+        @{ Text = '$statusLength -gt 64'; Count = 1 },
+        @{ Text = 'New-Object System.Text.UTF8Encoding($false, $true)'; Count = 1 },
+        @{ Text = '$TestOnlyPostExitDelayMilliseconds = 0'; Count = 1 },
+        @{ Text = '$TestOnlyExpireDeadlineAfterInitialCheck'; Count = 3 },
+        @{
+            Text = 'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {'
+            Count = 2
+        },
+        @{
+            Text = '$clock.ElapsedMilliseconds -lt $TimeoutMilliseconds'
+            Count = 3
+        }
+    )
+    foreach ($fragment in $processFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $ProcessSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+
+    $clockStartOffset = $ProcessSource.IndexOf(
+        '$clock = [System.Diagnostics.Stopwatch]::StartNew()',
+        [System.StringComparison]::Ordinal
+    )
+    $windowsLaunchOffset = $ProcessSource.IndexOf(
+        '$containedProcess = [PrivateMarker.ContainedProcess]::Start(',
+        [System.StringComparison]::Ordinal
+    )
+    $posixLaunchOffset = $ProcessSource.IndexOf(
+        '$processStarted = $process.Start()',
+        [System.StringComparison]::Ordinal
+    )
+    $firstElapsedDeadlineOffset = $ProcessSource.IndexOf(
+        'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {',
+        [System.StringComparison]::Ordinal
+    )
+    $finalElapsedDeadlineOffset = $ProcessSource.LastIndexOf(
+        'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {',
+        [System.StringComparison]::Ordinal
+    )
+    $treeStopOffset = $ProcessSource.IndexOf(
+        '$needsTreeStop = $timedOut -or',
+        [System.StringComparison]::Ordinal
+    )
+    $streamsCompletedOffset = $ProcessSource.IndexOf(
+        '$streamsCompleted = $null -ne $stdoutTask',
+        [System.StringComparison]::Ordinal
+    )
+    if ($clockStartOffset -lt 0 -or
+        $windowsLaunchOffset -lt 0 -or
+        $posixLaunchOffset -lt 0 -or
+        $firstElapsedDeadlineOffset -lt 0 -or
+        $finalElapsedDeadlineOffset -le $firstElapsedDeadlineOffset -or
+        $treeStopOffset -lt 0 -or
+        $streamsCompletedOffset -lt 0 -or
+        $clockStartOffset -ge $windowsLaunchOffset -or
+        $clockStartOffset -ge $posixLaunchOffset -or
+        $firstElapsedDeadlineOffset -ge $treeStopOffset -or
+        $finalElapsedDeadlineOffset -ge $streamsCompletedOffset) {
+        return $false
+    }
+
+    if ($ProcessSource -match '(?im)^\s*\$IsMacOS\s*=') {
+        return $false
+    }
+
+    $selfTestFragments = @(
+        @{
+            Text = '$posixPipeResult.PosixSessionGate -cne $expectedGate'
+            Count = 1
+        },
+        @{ Text = '$posixPipeResult.ExitCode -ne 0'; Count = 1 },
+        @{ Text = 'ExpectedGate = $automaticGate'; Count = 1 },
+        @{ Text = 'ExpectedGate = ''native-setsid'''; Count = 1 },
+        @{
+            Text = 'if ($failures.Count -eq $posixFailureCountBefore) {'
+            Count = 1
+        },
+        @{ Text = '$posixGateFailureReasonCases = @('; Count = 1 },
+        @{ Text = 'synthetic-sensitive-content'; Count = 1 },
+        @{
+            Text = 'post-exit setup deadline to reject an already exited zero-code child'
+            Count = 1
+        },
+        @{
+            Text = 'post-stream cleanup deadline to reject a zero-code child'
+            Count = 1
+        },
+        @{
+            Text = 'read-only IsMacOS automatic variable'
+            Count = 1
+        },
+        @{
+            Text = 'POSIX containment evidence: automatic=$automaticGate; forced=native-setsid; target-exit=0; descendant-started=true; descendant-stopped=true.'
+            Count = 1
+        }
+    )
+    foreach ($fragment in $selfTestFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $SelfTestSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-PosixContainmentEvidenceValidatorRegressions {
+    param(
+        [string]$ProcessRelativePath,
+        [string]$SelfTestRelativePath
+    )
+
+    $processPath = Get-RepoFilePath -RelativePath $ProcessRelativePath
+    $selfTestPath = Get-RepoFilePath -RelativePath $SelfTestRelativePath
+    if (-not (Test-Path -LiteralPath $processPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $selfTestPath -PathType Leaf)) {
+        Add-Failure 'Cannot inspect missing POSIX containment contract source.'
+        return
+    }
+
+    $processSource = Get-Content -LiteralPath $processPath -Raw
+    $selfTestSource = Get-Content -LiteralPath $selfTestPath -Raw
+    if (-not (Test-PosixContainmentEvidenceContract `
+            -ProcessSource $processSource `
+            -SelfTestSource $selfTestSource)) {
+        Add-Failure 'POSIX containment gate provenance, exit evidence, diagnostic, or native resolver contract is incomplete.'
+        return
+    }
+
+    $mutations = @(
+        [pscustomobject]@{
+            Name = 'returned gate provenance'
+            ProcessSource = $processSource.Replace(
+                'PosixSessionGate = $posixSessionGate',
+                'GateEvidenceRemoved = $posixSessionGate'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'external gate provenance'
+            ProcessSource = $processSource.Replace(
+                '$posixSessionGate = ''external-setsid''',
+                '$posixSessionGate = ''unknown-external-gate'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'native gate provenance'
+            ProcessSource = $processSource.Replace(
+                '$posixSessionGate = ''native-setsid''',
+                '$posixSessionGate = ''unknown-native-gate'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'Linux native library'
+            ProcessSource = $processSource.Replace(
+                '"libc"',
+                '"missing-linux-native-library"'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'automatic variable collision'
+            ProcessSource = $processSource + (
+                [Environment]::NewLine + '$IsMacOS = $true'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'fixed gate diagnostic mapper'
+            ProcessSource = $processSource.Replace(
+                'function ConvertTo-PrivateMarkerPosixGateFailureReason',
+                'function ConvertTo-RemovedPosixGateFailureReason'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'bounded gate diagnostic reader'
+            ProcessSource = $processSource.Replace(
+                'function Read-PrivateMarkerPosixGateStatus',
+                'function Read-RemovedPosixGateStatus'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'gate diagnostic status channel'
+            ProcessSource = $processSource.Replace(
+                'Join-Path $gateRoot "private-marker-posix-status-$gateId"',
+                'Join-Path $gateRoot "removed-posix-status-$gateId"'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'compile stage diagnostic'
+            ProcessSource = $processSource.Replace(
+                'Write-NativeGateStatus ''compile''',
+                'Write-NativeGateStatus ''removed-compile-stage'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'parent gate diagnostic read'
+            ProcessSource = $processSource.Replace(
+                '-Path $posixGateStatusPath',
+                '-Path $null'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'shared handshake deadline'
+            ProcessSource = $processSource.Replace(
+                '$clock.ElapsedMilliseconds -lt $TimeoutMilliseconds',
+                '$true'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'elapsed-only success deadlines'
+            ProcessSource = $processSource.Replace(
+                'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {',
+                'if ($false) {'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'post-exit deadline regression seam'
+            ProcessSource = $processSource.Replace(
+                '$TestOnlyPostExitDelayMilliseconds = 0',
+                '$RemovedPostExitDelayMilliseconds = 0'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'observed gate assertion'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$posixPipeResult.PosixSessionGate -cne $expectedGate',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'automatic gate expectation'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'ExpectedGate = $automaticGate',
+                'ExpectedGate = ''unchecked-automatic-gate'''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'forced native gate expectation'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'ExpectedGate = ''native-setsid''',
+                'ExpectedGate = ''unchecked-forced-gate'''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'target exit assertion'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$posixPipeResult.ExitCode -ne 0',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'evidence success guard'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'if ($failures.Count -eq $posixFailureCountBefore) {',
+                'if ($true) {'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'fixed POSIX evidence'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'POSIX containment evidence:',
+                'POSIX evidence removed:'
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if ($mutation.ProcessSource -ceq $processSource -and
+            $mutation.SelfTestSource -ceq $selfTestSource) {
+            Add-Failure "POSIX containment validator mutation was ineffective: $($mutation.Name)"
+            continue
+        }
+        if (Test-PosixContainmentEvidenceContract `
+                -ProcessSource $mutation.ProcessSource `
+                -SelfTestSource $mutation.SelfTestSource) {
+            Add-Failure "POSIX containment validator accepted mutation: $($mutation.Name)"
+        }
+    }
+}
+
+function Test-ScannerGitExactRootContract {
+    param(
+        [string]$ScannerSource,
+        [string]$SelfTestSource
+    )
+
+    $rawPrefixBlock = @(
+        '            $reportedPrefixBytes = [byte[]]@(',
+        '                $exactRootProbe.StandardOutputBytes',
+        '            )',
+        '            $isLfOnlyPrefix =',
+        '                $reportedPrefixBytes.Length -eq 1 -and',
+        '                $reportedPrefixBytes[0] -eq [byte]0x0A',
+        '            $isCrLfOnlyPrefix =',
+        '                $reportedPrefixBytes.Length -eq 2 -and',
+        '                $reportedPrefixBytes[0] -eq [byte]0x0D -and',
+        '                $reportedPrefixBytes[1] -eq [byte]0x0A',
+        '            if (-not ($isLfOnlyPrefix -or $isCrLfOnlyPrefix)) {'
+    ) -join "`n"
+    $scannerFragments = @(
+        @{ Text = '$rootProbe = Invoke-ScannerGit'; Count = 1 },
+        @{
+            Text = '-Arguments @(''-C'', $canonicalRoot, ''rev-parse'', ''--show-toplevel'')'
+            Count = 1
+        },
+        @{ Text = '-Result $rootProbe'; Count = 1 },
+        @{ Text = '$exactRootProbe = Invoke-ScannerGit'; Count = 1 },
+        @{
+            Text = '-Arguments @(''-C'', $canonicalRoot, ''rev-parse'', ''--show-prefix'')'
+            Count = 1
+        },
+        @{ Text = '-MaximumStandardOutputBytes 4096'; Count = 1 },
+        @{ Text = '-Result $exactRootProbe'; Count = 1 },
+        @{ Text = $rawPrefixBlock; Count = 1 },
+        @{
+            Text = "throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'"
+            Count = 1
+        },
+        @{ Text = '$indexProbe = Invoke-ScannerGit'; Count = 1 }
+    )
+    foreach ($fragment in $scannerFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $ScannerSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+
+    # worktree 証明 -> Git-native exact-root probe -> raw byte比較 ->
+    # index 列挙の順序も固定し、dead codeへの文字列退避を受理しにくくする。
+    $orderedFragments = @(
+        '$rootProbe = Invoke-ScannerGit',
+        '-Result $rootProbe',
+        '$exactRootProbe = Invoke-ScannerGit',
+        '-Result $exactRootProbe',
+        $rawPrefixBlock,
+        "throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'",
+        '$indexProbe = Invoke-ScannerGit'
+    )
+    $previousOffset = -1
+    foreach ($fragment in $orderedFragments) {
+        $offset = $ScannerSource.IndexOf(
+            $fragment,
+            $previousOffset + 1,
+            [System.StringComparison]::Ordinal
+        )
+        if ($offset -le $previousOffset) {
+            return $false
+        }
+        $previousOffset = $offset
+    }
+
+    $rootAliasFailurePredicate = @(
+        '        if ($rootAliasResult.ExitCode -ne 0 -or',
+        '            -not $rootAliasResult.StreamsCompleted -or',
+        '            -not $rootAliasResult.TreeStopped -or',
+        '            $rootAliasResult.TimedOut -or',
+        '            $rootAliasResult.OutputLimitExceeded -or',
+        '            $rootAliasResult.PipeLeakDetected) {'
+    ) -join "`n"
+    $selfTestFragments = @(
+        @{ Text = 'PRIVATE_MARKER_ROOT_ALIAS'; Count = 2 },
+        @{
+            Text = 'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''root-alias'''
+            Count = 1
+        },
+        @{
+            Text = 'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''whitespace-prefix'''
+            Count = 1
+        },
+        @{
+            Text = 'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''bom-prefix'''
+            Count = 1
+        },
+        @{
+            Text = 'var bytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x0A };'
+            Count = 1
+        },
+        @{ Text = $rootAliasFailurePredicate; Count = 1 },
+        @{
+            Text = '$gitDirectoryResult.Output -notmatch ''Git root probe failed closed'''
+            Count = 1
+        },
+        @{
+            Text = '$unicodeWhitespaceResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        },
+        @{
+            Text = '$whitespacePrefixResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        },
+        @{
+            Text = '$bomPrefixResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        },
+        @{
+            Text = '$subdirectoryResult.Output -notmatch ''exact Git worktree root'''
+            Count = 1
+        }
+    )
+    foreach ($fragment in $selfTestFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $SelfTestSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+
+    $orderedSelfTestFragments = @(
+        '$rootAliasResult = Invoke-Scanner',
+        'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''root-alias''',
+        $rootAliasFailurePredicate,
+        'Add-Failure "Expected a Git-reported physical root alias to remain accepted.',
+        '$bomPrefixResult = Invoke-Scanner',
+        'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''bom-prefix''',
+        '$bomPrefixResult.Output -notmatch ''exact Git worktree root'''
+    )
+    $previousOffset = -1
+    foreach ($fragment in $orderedSelfTestFragments) {
+        $offset = $SelfTestSource.IndexOf(
+            $fragment,
+            $previousOffset + 1,
+            [System.StringComparison]::Ordinal
+        )
+        if ($offset -le $previousOffset) {
+            return $false
+        }
+        $previousOffset = $offset
+    }
+    return $true
+}
+
+function Assert-ScannerGitExactRootValidatorRegressions {
+    param(
+        [string]$ScannerRelativePath,
+        [string]$SelfTestRelativePath
+    )
+
+    $scannerPath = Get-RepoFilePath -RelativePath $ScannerRelativePath
+    $selfTestPath = Get-RepoFilePath -RelativePath $SelfTestRelativePath
+    if (-not (Test-Path -LiteralPath $scannerPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $selfTestPath -PathType Leaf)) {
+        Add-Failure 'Cannot inspect missing Git exact-root contract source.'
+        return
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $scannerSource = [System.IO.File]::ReadAllText($scannerPath, $strictUtf8)
+        $selfTestSource = [System.IO.File]::ReadAllText($selfTestPath, $strictUtf8)
+    }
+    catch {
+        Add-Failure 'Git exact-root contract sources must be valid UTF-8.'
+        return
+    }
+
+    if (-not (Test-ScannerGitExactRootContract `
+            -ScannerSource $scannerSource `
+            -SelfTestSource $selfTestSource)) {
+        Add-Failure 'Git exact-root worktree proof, strict prefix check, or regressions are incomplete.'
+        return
+    }
+
+    $rawPrefixGuard =
+        'if (-not ($isLfOnlyPrefix -or $isCrLfOnlyPrefix)) {'
+    $rootAliasFailurePredicate = @(
+        '        if ($rootAliasResult.ExitCode -ne 0 -or',
+        '            -not $rootAliasResult.StreamsCompleted -or',
+        '            -not $rootAliasResult.TreeStopped -or',
+        '            $rootAliasResult.TimedOut -or',
+        '            $rootAliasResult.OutputLimitExceeded -or',
+        '            $rootAliasResult.PipeLeakDetected) {'
+    ) -join "`n"
+    $bomNormalization = @(
+        '            if ($reportedPrefixBytes.Length -ge 3 -and',
+        '                $reportedPrefixBytes[0] -eq [byte]0xEF -and',
+        '                $reportedPrefixBytes[1] -eq [byte]0xBB -and',
+        '                $reportedPrefixBytes[2] -eq [byte]0xBF) {',
+        '                $reportedPrefixBytes = $reportedPrefixBytes[3..($reportedPrefixBytes.Length - 1)]',
+        '            }',
+        '            $isLfOnlyPrefix ='
+    ) -join "`n"
+    $mutations = @(
+        [pscustomobject]@{
+            Name = 'worktree proof removal'
+            ScannerSource = $scannerSource.Replace(
+                '$rootProbe = Invoke-ScannerGit',
+                '$removedRootProbe = Invoke-ScannerGit'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'Git-native prefix probe'
+            ScannerSource = $scannerSource.Replace(
+                '''--show-prefix''',
+                '''--show-toplevel'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'exact-root healthy boundary'
+            ScannerSource = $scannerSource.Replace(
+                '-Result $exactRootProbe',
+                '-Result $rootProbe'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'strict prefix guard removal'
+            ScannerSource = $scannerSource.Replace(
+                $rawPrefixGuard,
+                'if ($false) {'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'exact-root fail-closed throw'
+            ScannerSource = $scannerSource.Replace(
+                "throw 'Scan path must be the exact Git worktree root; subdirectories are rejected.'",
+                '$null = $reportedPrefixBytes'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'LF raw byte contract'
+            ScannerSource = $scannerSource.Replace(
+                '$reportedPrefixBytes[0] -eq [byte]0x0A',
+                '$reportedPrefixBytes[0] -eq [byte]0x20'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'BOM normalization before raw comparison'
+            ScannerSource = $scannerSource.Replace(
+                '            $isLfOnlyPrefix =',
+                $bomNormalization
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'root alias regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''root-alias''',
+                'PRIVATE_MARKER_SYNTHETIC_GIT_MODE = ''unchecked-root-alias'''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'vacuous root alias success predicate'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                $rootAliasFailurePredicate,
+                '        if ($false) {'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'Git administrative directory regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$gitDirectoryResult.Output -notmatch ''Git root probe failed closed''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'Unicode whitespace subdirectory regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$unicodeWhitespaceResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'whitespace-only prefix regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$whitespacePrefixResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'BOM-prefixed raw output regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$bomPrefixResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'normal subdirectory regression'
+            ScannerSource = $scannerSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$subdirectoryResult.Output -notmatch ''exact Git worktree root''',
+                '$false'
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if ($mutation.ScannerSource -ceq $scannerSource -and
+            $mutation.SelfTestSource -ceq $selfTestSource) {
+            Add-Failure "Git exact-root validator mutation was ineffective: $($mutation.Name)"
+            continue
+        }
+        if (Test-ScannerGitExactRootContract `
+                -ScannerSource $mutation.ScannerSource `
+                -SelfTestSource $mutation.SelfTestSource) {
+            Add-Failure "Git exact-root validator accepted mutation: $($mutation.Name)"
+        }
+    }
+}
+
 function Test-PrivateMarkerRegexTypeText {
     param([AllowNull()][object]$Text)
 
@@ -1030,6 +2028,7 @@ $requiredFiles = @(
     'SECURITY.md',
     'SKILL.md',
     'docs/SKILL.ja.md',
+    'docs/macos-pwsh-ci-contract.md',
     'examples/inspection-one-liners.md',
     'examples/guarded-normalization.md',
     'examples/gitattributes-editorconfig-sample.md',
@@ -1060,6 +2059,27 @@ Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'tim
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'uses:\s*actions/checkout@[0-9a-f]{40}(?:\s*#\s*v5)?' -Description 'immutable checkout action revision'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)shell:\s*powershell\s+run:\s*\.\\scripts\\test-scan-private-markers\.ps1' -Description 'explicit Windows PowerShell 5.1 scanner self-test'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)validate-ubuntu:.*runs-on:\s*ubuntu-24\.04.*test-scan-private-markers\.ps1' -Description 'Ubuntu POSIX containment self-test'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'macOS 15 job uses PowerShell 7 only' -Description 'macOS PowerShell-only platform distinction'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'macos-15-arm64' -Description 'measured macOS runner image'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'PowerShell Core\s+`7\.6\.3`' -Description 'measured macOS PowerShell version'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern 'Platform results are not interchangeable' -Description 'contributor platform evidence distinction'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '30205393010' -Description 'contributor macOS evidence run'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern 'macOS 15 job uses PowerShell 7 only' -Description 'security platform containment distinction'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern 'automatic=native-setsid' -Description 'measured macOS automatic gate'
+Assert-FileContains -RelativePath 'CHANGELOG.md' -Pattern '30205393010' -Description 'changelog macOS evidence run'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?im)^Status:\s*verified' -Description 'verified macOS evidence status'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'macos-15-arm64.*20260715\.0234\.1' -Description 'documented macOS runner image evidence'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'PowerShell Core\s+`7\.6\.3`' -Description 'documented macOS PowerShell evidence'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'job/89802443609' -Description 'documented macOS job evidence'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?s)canonical top-level workflow shape.*direct child of that `jobs:`' -Description 'documented workflow shape and job membership contract'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?s)direct job headings.*`validate-ubuntu`.*`validate-macos`' -Description 'documented canonical direct job headings'
+Assert-FileDoesNotContain -RelativePath 'README.md' -Pattern 'job is being added|macOS remains unverified until' -Description 'stale pre-CI macOS limitation'
+Assert-FileDoesNotContain -RelativePath 'SECURITY.md' -Pattern 'until its pull-request run succeeds|macOS behavior remains\s+unverified' -Description 'stale pre-CI macOS security limitation'
+Assert-FileDoesNotContain -RelativePath 'CONTRIBUTING.md' -Pattern 'Until that pull-request job is green' -Description 'stale pre-CI contributor limitation'
+Assert-FileDoesNotContain -RelativePath 'CHANGELOG.md' -Pattern 'macOS execution remains unverified' -Description 'stale pre-CI changelog status'
+Assert-FileDoesNotContain -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?im)^Status:.*unverified|Before the pull-request job is green' -Description 'stale pre-CI evidence status'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'PosixSessionGate' -Description 'documented POSIX gate provenance'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'DllImport\("libc"\)' -Description 'documented POSIX native resolver contract'
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner self-test'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'PosixSignal.*IsSuccessfulResult' -Description 'POSIX errno cleanup regression coverage'
@@ -1069,6 +2089,60 @@ Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern '\
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'regex-match-timeout' -Description 'adversarial regex no-match regression'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?ms)^## Dogfooding.*Windows PowerShell 5\.1.*UTF-8\s+BOM' -Description 'PowerShell 5.1 BOM exception in dogfooding guidance'
 
+$expectedMacOsWorkflowJob = @'
+  validate-macos:
+    name: Validate macOS PowerShell 7
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Verify macOS and PowerShell Core
+        shell: pwsh
+        run: |
+          if (-not $IsMacOS) {
+            throw 'Expected a macOS host.'
+          }
+          if ($PSVersionTable.PSEdition -cne 'Core') {
+            throw 'Expected PowerShell Core.'
+          }
+          if ($PSVersionTable.PSVersion.Major -ne 7) {
+            throw 'Expected PowerShell 7.'
+          }
+          Write-Host "macOS compatibility canary: pwsh=$($PSVersionTable.PSVersion); edition=Core."
+
+      - name: Validate OSS readiness
+        shell: pwsh
+        run: ./scripts/validate-oss-readiness.ps1
+
+      - name: Test private marker scan (PowerShell 7 on macOS)
+        shell: pwsh
+        run: ./scripts/test-scan-private-markers.ps1
+
+      - name: Scan for private markers
+        shell: pwsh
+        run: ./scripts/scan-private-markers.ps1
+
+      - name: Check whitespace
+        shell: pwsh
+        run: git diff-tree --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
+'@
+Assert-WorkflowJobBlockExact `
+    -RelativePath '.github/workflows/validate.yml' `
+    -JobName 'validate-macos' `
+    -ExpectedBlock $expectedMacOsWorkflowJob
+Assert-WorkflowJobBlockValidatorRegressions `
+    -RelativePath '.github/workflows/validate.yml' `
+    -JobName 'validate-macos' `
+    -ExpectedBlock $expectedMacOsWorkflowJob
+
+Assert-PosixContainmentEvidenceValidatorRegressions `
+    -ProcessRelativePath 'scripts/private-marker-process.ps1' `
+    -SelfTestRelativePath 'scripts/test-scan-private-markers.ps1'
+Assert-ScannerGitExactRootValidatorRegressions `
+    -ScannerRelativePath 'scripts/scan-private-markers.ps1' `
+    -SelfTestRelativePath 'scripts/test-scan-private-markers.ps1'
 Assert-ScannerHasOnlyBoundedRegexOperations `
     -RelativePath 'scripts/scan-private-markers.ps1'
 Assert-ScannerRegexPolicyValidatorRegressions `

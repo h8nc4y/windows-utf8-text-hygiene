@@ -739,6 +739,79 @@ function Test-PrivateMarkerWindowsHost {
     }
 }
 
+function ConvertTo-PrivateMarkerPosixGateFailureReason {
+    param([AllowEmptyString()][string]$Status)
+
+    # child由来の任意文字列を例外へ反射しない。既知stageと有限桁errnoだけを
+    # fixed diagnosticへ変換し、pathやtarget stderrは公開しない。
+    if ($Status -cmatch '^setsid-error-(?<errno>[0-9]{1,5})$') {
+        return "setsid-error-$($Matches['errno'])"
+    }
+    switch -CaseSensitive ($Status) {
+        'compile' { return 'compile' }
+        'setsid-library' { return 'setsid-library' }
+        'setsid-entrypoint' { return 'setsid-entrypoint' }
+        'setsid-call' { return 'setsid-call' }
+        'ready-prepare' { return 'ready-prepare' }
+        'ready-write' { return 'ready-write' }
+        default { return 'unknown' }
+    }
+}
+
+function Read-PrivateMarkerPosixGateStatus {
+    param([AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ''
+    }
+
+    $statusStream = $null
+    try {
+        # length確認とreadを別handleへ分けず、最大65 bytesだけを読む。
+        # overflow・invalid UTF-8・I/O失敗はすべてfixed unknownへ畳み込む。
+        $statusStream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            (
+                [System.IO.FileShare]::ReadWrite -bor
+                [System.IO.FileShare]::Delete
+            )
+        )
+        $statusBytes = New-Object byte[] 65
+        $statusLength = 0
+        while ($statusLength -lt $statusBytes.Length) {
+            $readLength = $statusStream.Read(
+                $statusBytes,
+                $statusLength,
+                $statusBytes.Length - $statusLength
+            )
+            if ($readLength -eq 0) {
+                break
+            }
+            $statusLength += $readLength
+        }
+        if ($statusLength -eq 0 -or $statusLength -gt 64) {
+            return ''
+        }
+        $strictUtf8 =
+            New-Object System.Text.UTF8Encoding($false, $true)
+        return $strictUtf8.GetString(
+            $statusBytes,
+            0,
+            $statusLength
+        )
+    }
+    catch {
+        return ''
+    }
+    finally {
+        if ($null -ne $statusStream) {
+            $statusStream.Dispose()
+        }
+    }
+}
+
 function ConvertTo-PrivateMarkerProcessArgument {
     param([AllowEmptyString()][string]$Argument)
 
@@ -994,6 +1067,15 @@ function Invoke-PrivateMarkerProcess {
         [ValidateRange(250, 5000)]
         [int]$StreamCleanupWaitMilliseconds = 5000,
 
+        # Self-test専用。正常終了を確認した後だけlaunch/setup期限を消費し、
+        # 終了済みprocessを成功へ誤昇格しないことを測る。
+        [ValidateRange(0, 6000)]
+        [int]$TestOnlyPostExitDelayMilliseconds = 0,
+
+        # Self-test専用。初回期限検査の後だけ残時間を消費し、stream回収と
+        # cleanup後の最終期限検査を独立に測る。
+        [switch]$TestOnlyExpireDeadlineAfterInitialCheck,
+
         # /usr/bin/setsid が無いPOSIX host向けnative gateをself-testで
         # 強制し、portable fallbackも同じcontainment契約で検証する。
         [switch]$ForceNativePosixSessionGate
@@ -1011,8 +1093,10 @@ function Invoke-PrivateMarkerProcess {
     $containedProcess = $null
     $processStarted = $false
     $posixProcessGroupId = 0
+    $posixSessionGate = ''
     $posixGateReadyPath = $null
     $posixGateReleasePath = $null
+    $posixGateStatusPath = $null
     $stdinStream = $null
     $stdoutStream = $null
     $stderrStream = $null
@@ -1028,6 +1112,9 @@ function Invoke-PrivateMarkerProcess {
     $exitCode = -1
     $stdoutBytes = New-Object byte[] 0
     $stderrBytes = New-Object byte[] 0
+    # 起動・native gate handshake・target実行を単一deadlineで所有する。
+    # CI専用の猶予を足さず、production既定15秒も同じ時計で検証する。
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
         # 子へ渡す environment は親 process の clone から作り、親自身は変更しない。
@@ -1080,12 +1167,14 @@ function Invoke-PrivateMarkerProcess {
                 -not [string]::IsNullOrWhiteSpace($setsidPath)) {
                 # setsid自身がtargetをexecする前にsession/process groupを作る。
                 # targetは親がgroup IDを記録する前に走れても境界外へは出られない。
+                $posixSessionGate = 'external-setsid'
                 $effectiveFileName = $setsidPath
                 $effectiveArguments = @('--', $FileName) + @($Arguments)
             } else {
                 # macOS等でsetsid executableが無い場合は、同じpwsh child内で
                 # setsid(2)を先に実行し、親がgroup IDを記録するまでtargetを止める。
                 $useNativePosixSessionGate = $true
+                $posixSessionGate = 'native-setsid'
                 $gateRoot = if ([string]::IsNullOrWhiteSpace($IsolationRoot)) {
                     [System.IO.Path]::GetTempPath()
                 } else {
@@ -1100,6 +1189,8 @@ function Invoke-PrivateMarkerProcess {
                     Join-Path $gateRoot "private-marker-posix-ready-$gateId"
                 $posixGateReleasePath =
                     Join-Path $gateRoot "private-marker-posix-release-$gateId"
+                $posixGateStatusPath =
+                    Join-Path $gateRoot "private-marker-posix-status-$gateId"
                 $payloadJson = [pscustomobject]@{
                     FileName = $FileName
                     Arguments = @($Arguments)
@@ -1113,11 +1204,31 @@ function Invoke-PrivateMarkerProcess {
                 $releasePathBase64 = [Convert]::ToBase64String(
                     [System.Text.Encoding]::UTF8.GetBytes($posixGateReleasePath)
                 )
+                $statusPathBase64 = [Convert]::ToBase64String(
+                    [System.Text.Encoding]::UTF8.GetBytes($posixGateStatusPath)
+                )
                 $posixWrapperTemplate = @'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($null -eq ('PrivateMarker.NativePosixSession' -as [type])) {
-    Add-Type -TypeDefinition @"
+$statusPath = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String('__STATUS_PATH__')
+)
+function Write-NativeGateStatus([string]$Status) {
+    try {
+        [IO.File]::WriteAllText(
+            $statusPath,
+            $Status,
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+    catch {
+        # status channel自体の失敗は親側のfixed unknownへ畳み込む。
+    }
+}
+try {
+    Write-NativeGateStatus 'compile'
+    if ($null -eq ('PrivateMarker.NativePosixSession' -as [type])) {
+        Add-Type -TypeDefinition @"
 using System.Runtime.InteropServices;
 
 namespace PrivateMarker
@@ -1134,23 +1245,55 @@ namespace PrivateMarker
     }
 }
 "@
+    }
+}
+catch {
+    [Console]::Error.WriteLine('Bounded POSIX gate compile failed.')
+    exit 127
 }
 try {
-    if ([PrivateMarker.NativePosixSession]::Create() -lt 0) {
+    Write-NativeGateStatus 'setsid-call'
+    try {
+        $sessionResult = [PrivateMarker.NativePosixSession]::Create()
+    }
+    catch {
+        $baseException = $_.Exception.GetBaseException()
+        if ($baseException -is [System.DllNotFoundException]) {
+            Write-NativeGateStatus 'setsid-library'
+        } elseif ($baseException -is [System.EntryPointNotFoundException]) {
+            Write-NativeGateStatus 'setsid-entrypoint'
+        } else {
+            Write-NativeGateStatus 'setsid-call'
+        }
+        [Console]::Error.WriteLine('Bounded POSIX session call failed.')
+        exit 127
+    }
+    if ($sessionResult -lt 0) {
+        $nativeError =
+            [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-NativeGateStatus "setsid-error-$nativeError"
         [Console]::Error.WriteLine('Bounded POSIX session setup failed.')
         exit 126
     }
+    Write-NativeGateStatus 'ready-prepare'
     $readyPath = [Text.Encoding]::UTF8.GetString(
         [Convert]::FromBase64String('__READY_PATH__')
     )
     $releasePath = [Text.Encoding]::UTF8.GetString(
         [Convert]::FromBase64String('__RELEASE_PATH__')
     )
-    [IO.File]::WriteAllText(
-        $readyPath,
-        'ready',
-        [Text.UTF8Encoding]::new($false)
-    )
+    try {
+        [IO.File]::WriteAllText(
+            $readyPath,
+            'ready',
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+    catch {
+        Write-NativeGateStatus 'ready-write'
+        [Console]::Error.WriteLine('Bounded POSIX ready signal failed.')
+        exit 126
+    }
     $released = $false
     for ($gateAttempt = 0; $gateAttempt -lt 3000; $gateAttempt++) {
         if ([IO.File]::Exists($releasePath)) {
@@ -1185,6 +1328,9 @@ catch {
                 ).Replace(
                     '__RELEASE_PATH__',
                     $releasePathBase64
+                ).Replace(
+                    '__STATUS_PATH__',
+                    $statusPathBase64
                 ).Replace(
                     '__PAYLOAD__',
                     $payloadBase64
@@ -1241,7 +1387,8 @@ catch {
             if ($useNativePosixSessionGate) {
                 $posixGateReady = $false
                 for ($gateAttempt = 0;
-                    $gateAttempt -lt 2000;
+                    $gateAttempt -lt 2000 -and
+                    $clock.ElapsedMilliseconds -lt $TimeoutMilliseconds;
                     $gateAttempt++) {
                     if ([System.IO.File]::Exists($posixGateReadyPath)) {
                         $posixGateReady = $true
@@ -1250,11 +1397,28 @@ catch {
                     if ($process.HasExited) {
                         break
                     }
-                    Start-Sleep -Milliseconds 5
+                    $gateWaitMilliseconds = [Math]::Min(
+                        5,
+                        [Math]::Max(
+                            1,
+                            $TimeoutMilliseconds -
+                                [int]$clock.ElapsedMilliseconds
+                        )
+                    )
+                    Start-Sleep -Milliseconds $gateWaitMilliseconds
                 }
                 if (-not $posixGateReady) {
                     [void](Stop-PrivateMarkerProcessTree -Process $process)
-                    throw 'Failed to establish the bounded POSIX session gate.'
+                    $posixGateStatus =
+                        Read-PrivateMarkerPosixGateStatus `
+                            -Path $posixGateStatusPath
+                    $posixGateFailureReason =
+                        ConvertTo-PrivateMarkerPosixGateFailureReason `
+                            -Status $posixGateStatus
+                    throw (
+                        'Failed to establish the bounded POSIX session gate ' +
+                        "($posixGateFailureReason)."
+                    )
                 }
                 # readyはsetsid成功後だけ作られる。group IDを保持してから
                 # releaseするため、targetの最初の命令より先にcleanup先が確定する。
@@ -1288,7 +1452,6 @@ catch {
             $MaximumStandardErrorBytes
         )
 
-        $clock = [System.Diagnostics.Stopwatch]::StartNew()
         $effectiveInputBytes = if ($null -eq $StandardInputBytes) {
             New-Object byte[] 0
         } else {
@@ -1302,6 +1465,35 @@ catch {
                 $effectiveInputBytes,
                 0,
                 $effectiveInputBytes.Length
+            )
+        }
+        if ($TestOnlyPostExitDelayMilliseconds -gt 0) {
+            # host負荷に左右されないよう別の有限時計でchild終了を確認してから、
+            # main deadlineだけを意図的に超過させる。
+            $testOnlyExitWait = [System.Diagnostics.Stopwatch]::StartNew()
+            $testOnlyProcessHasExited = if ($null -ne $containedProcess) {
+                $containedProcess.HasExited
+            } else {
+                $process.HasExited
+            }
+            while (-not $testOnlyProcessHasExited -and
+                $testOnlyExitWait.ElapsedMilliseconds -lt 5000) {
+                if ($null -ne $containedProcess) {
+                    [void]$containedProcess.WaitForExit(10)
+                } else {
+                    [void]$process.WaitForExit(10)
+                }
+                $testOnlyProcessHasExited = if ($null -ne $containedProcess) {
+                    $containedProcess.HasExited
+                } else {
+                    $process.HasExited
+                }
+            }
+            if (-not $testOnlyProcessHasExited) {
+                throw 'Self-test child did not exit before the post-exit deadline delay.'
+            }
+            [System.Threading.Thread]::Sleep(
+                $TestOnlyPostExitDelayMilliseconds
             )
         }
         $processHasExited = if ($null -ne $containedProcess) {
@@ -1368,14 +1560,13 @@ catch {
             $stdinClosed = $true
         }
 
-        $processHasExited = if ($null -ne $containedProcess) {
-            $containedProcess.HasExited
-        } else {
-            $process.HasExited
-        }
-        if (-not $processHasExited -and
-            $clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+        # launch、containment、target、stdin処理の全経過時間だけで判定する。
+        # childが既に0で終了していてもdeadline超過を成功へ昇格させない。
+        if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
             $timedOut = $true
+        }
+        if ($TestOnlyExpireDeadlineAfterInitialCheck -and $timedOut) {
+            throw 'Self-test deadline expired before the post-check delay.'
         }
 
         $needsTreeStop = $timedOut -or
@@ -1452,6 +1643,19 @@ catch {
             $stderrBytes = $stderrTask.Result.Data
             $outputLimitExceeded = $outputLimitExceeded -or $stderrTask.Result.LimitExceeded
         }
+        if ($TestOnlyExpireDeadlineAfterInitialCheck) {
+            # 初回deadline検査を未超過で通過した後、result直前の検査だけが
+            # 捕捉できるよう残時間と固定100msを消費する。
+            $testOnlyRemainingMilliseconds = [Math]::Max(
+                1,
+                $TimeoutMilliseconds -
+                    [int]$clock.ElapsedMilliseconds +
+                    100
+            )
+            [System.Threading.Thread]::Sleep(
+                $testOnlyRemainingMilliseconds
+            )
+        }
     }
     finally {
         if ($processStarted) {
@@ -1502,7 +1706,8 @@ catch {
         }
         foreach ($gatePath in @(
             $posixGateReadyPath,
-            $posixGateReleasePath
+            $posixGateReleasePath,
+            $posixGateStatusPath
         )) {
             if (-not [string]::IsNullOrWhiteSpace($gatePath)) {
                 try {
@@ -1515,6 +1720,11 @@ catch {
         }
     }
 
+    # stream回収、process-tree停止、handle/pipe disposalも同じtotal
+    # deadlineに含め、成功受理直前に単調時計を再確認する。
+    if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+        $timedOut = $true
+    }
     $streamsCompleted = $null -ne $stdoutTask -and
         $null -ne $stderrTask -and
         $stdoutTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion -and
@@ -1523,6 +1733,7 @@ catch {
 
     return [pscustomobject]@{
         ExitCode = $exitCode
+        PosixSessionGate = $posixSessionGate
         StandardOutputBytes = $stdoutBytes
         StandardErrorBytes = $stderrBytes
         TimedOut = $timedOut

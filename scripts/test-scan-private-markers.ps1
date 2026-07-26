@@ -492,13 +492,195 @@ $stream.Flush()
         Add-Failure 'Expected hostile nonexistent scan paths to emit exactly one fixed stderr code plus the platform newline.'
     }
 
+    # native wrapperはPowerShell 7のread-only `$IsMacOS` と
+    # case-insensitiveに衝突する名前へ代入してはならない。
+    $processBoundarySource = [System.IO.File]::ReadAllText($processBoundary)
+    if ($processBoundarySource -cmatch '(?im)^\s*\$IsMacOS\s*=') {
+        Add-Failure 'Expected the native POSIX wrapper to avoid the read-only IsMacOS automatic variable.'
+    }
+
+    # child statusは固定allowlistだけを親例外へ変換し、任意文字列やpathを
+    # CI logへ反射しない。errnoも有限桁のdecimalだけを許可する。
+    $posixGateFailureReasonCases = @(
+        [pscustomobject]@{ Status = 'compile'; Expected = 'compile' },
+        [pscustomobject]@{
+            Status = 'setsid-library'
+            Expected = 'setsid-library'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-entrypoint'
+            Expected = 'setsid-entrypoint'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-call'
+            Expected = 'setsid-call'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-error-1'
+            Expected = 'setsid-error-1'
+        },
+        [pscustomobject]@{
+            Status = 'ready-prepare'
+            Expected = 'ready-prepare'
+        },
+        [pscustomobject]@{
+            Status = 'ready-write'
+            Expected = 'ready-write'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-error-123456'
+            Expected = 'unknown'
+        },
+        [pscustomobject]@{
+            Status = 'synthetic-sensitive-value'
+            Expected = 'unknown'
+        }
+    )
+    foreach ($reasonCase in $posixGateFailureReasonCases) {
+        $actualReason = ConvertTo-PrivateMarkerPosixGateFailureReason `
+            -Status $reasonCase.Status
+        if ($actualReason -cne $reasonCase.Expected) {
+            Add-Failure 'Expected POSIX gate status to map to its fixed allowlisted reason.'
+        }
+    }
+
+    $posixStatusReadFixture =
+        Join-Path $tempRoot 'synthetic-posix-gate-status'
+    $posixStatusReadCases = @(
+        [pscustomobject]@{
+            Label = 'known'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes('compile')
+            ExpectedText = 'compile'
+            ExpectedReason = 'compile'
+        },
+        [pscustomobject]@{
+            Label = '65-byte-rejection'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes(('x' * 65))
+            ExpectedText = ''
+            ExpectedReason = 'unknown'
+        },
+        [pscustomobject]@{
+            Label = 'invalid-utf8'
+            Bytes = [byte[]]@(0xC3, 0x28)
+            ExpectedText = ''
+            ExpectedReason = 'unknown'
+        },
+        [pscustomobject]@{
+            Label = 'synthetic-sensitive-content'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes(
+                '<local-path>/synthetic-sensitive-value'
+            )
+            ExpectedText = '<local-path>/synthetic-sensitive-value'
+            ExpectedReason = 'unknown'
+        }
+    )
+    foreach ($statusReadCase in $posixStatusReadCases) {
+        try {
+            [System.IO.File]::WriteAllBytes(
+                $posixStatusReadFixture,
+                [byte[]]$statusReadCase.Bytes
+            )
+            $actualStatusText =
+                Read-PrivateMarkerPosixGateStatus `
+                    -Path $posixStatusReadFixture
+            $actualStatusReason =
+                ConvertTo-PrivateMarkerPosixGateFailureReason `
+                    -Status $actualStatusText
+            if ($actualStatusText -cne $statusReadCase.ExpectedText -or
+                $actualStatusReason -cne $statusReadCase.ExpectedReason) {
+                Add-Failure 'Expected bounded POSIX status input to produce only its fixed result.'
+            }
+        }
+        finally {
+            if ([System.IO.File]::Exists($posixStatusReadFixture)) {
+                [System.IO.File]::Delete($posixStatusReadFixture)
+            }
+        }
+    }
+
+    # childは0で即時終了させ、終了確認後だけself-test seamでdeadlineを
+    # 消費する。旧「未終了かつ期限超過」条件のfalse-greenを直接測る。
+    $instantExitExecutable = if (Test-PrivateMarkerWindowsHost) {
+        [Environment]::GetEnvironmentVariable('ComSpec', 'Process')
+    } else {
+        '/bin/sh'
+    }
+    if ([string]::IsNullOrWhiteSpace($instantExitExecutable) -or
+        -not (Test-Path -LiteralPath $instantExitExecutable -PathType Leaf)) {
+        Add-Failure 'Expected an absolute native shell for the post-exit deadline regression.'
+    } else {
+        $instantExitArguments = if (Test-PrivateMarkerWindowsHost) {
+            @('/d', '/c', 'exit 0')
+        } else {
+            @('-c', 'exit 0')
+        }
+        $expiredCompletedProcessResult = Invoke-PrivateMarkerProcess `
+            -FileName $instantExitExecutable `
+            -Arguments $instantExitArguments `
+            -WorkingDirectory $tempRoot `
+            -TimeoutMilliseconds 5000 `
+            -TestOnlyPostExitDelayMilliseconds 5100
+        if (-not $expiredCompletedProcessResult.TimedOut -or
+            $expiredCompletedProcessResult.ExitCode -ne 0 -or
+            $expiredCompletedProcessResult.OutputLimitExceeded -or
+            $expiredCompletedProcessResult.InputWriteFailed -or
+            $expiredCompletedProcessResult.PipeLeakDetected -or
+            -not $expiredCompletedProcessResult.StreamsCompleted -or
+            -not $expiredCompletedProcessResult.TreeStopped) {
+            Add-Failure 'Expected the post-exit setup deadline to reject an already exited zero-code child.'
+        }
+
+        # 初回検査を期限内に通し、stream回収後だけ残時間を消費する。
+        # cleanup後のelapsed-only再検査が無い旧実装を独立に赤へする。
+        $expiredAfterInitialCheckResult = Invoke-PrivateMarkerProcess `
+            -FileName $instantExitExecutable `
+            -Arguments $instantExitArguments `
+            -WorkingDirectory $tempRoot `
+            -TimeoutMilliseconds 5000 `
+            -TestOnlyExpireDeadlineAfterInitialCheck
+        if (-not $expiredAfterInitialCheckResult.TimedOut -or
+            $expiredAfterInitialCheckResult.ExitCode -ne 0 -or
+            $expiredAfterInitialCheckResult.OutputLimitExceeded -or
+            $expiredAfterInitialCheckResult.InputWriteFailed -or
+            $expiredAfterInitialCheckResult.PipeLeakDetected -or
+            -not $expiredAfterInitialCheckResult.StreamsCompleted -or
+            -not $expiredAfterInitialCheckResult.TreeStopped) {
+            Add-Failure 'Expected the post-stream cleanup deadline to reject a zero-code child.'
+        }
+    }
+
     if (-not (Test-PrivateMarkerWindowsHost)) {
         # direct parentが終了済みでも、同じprocess groupの孫をsignalして
         # inherited pipeと遅延sentinelの両方を確実に閉じる。
+        $posixFailureCountBefore = $failures.Count
+        $externalSetsidPath = @('/usr/bin/setsid', '/bin/setsid') |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+        $automaticGate = if (
+            [string]::IsNullOrWhiteSpace($externalSetsidPath)
+        ) {
+            'native-setsid'
+        } else {
+            'external-setsid'
+        }
         $posixSurvivedSentinels =
             New-Object System.Collections.Generic.List[string]
-        foreach ($forceNativeGate in @($false, $true)) {
-            $gateLabel = if ($forceNativeGate) { 'native' } else { 'setsid' }
+        $posixGateCases = @(
+            [pscustomobject]@{
+                Label = 'automatic'
+                ForceNative = $false
+                ExpectedGate = $automaticGate
+            },
+            [pscustomobject]@{
+                Label = 'forced-native'
+                ForceNative = $true
+                ExpectedGate = 'native-setsid'
+            }
+        )
+        foreach ($gateCase in $posixGateCases) {
+            $gateLabel = $gateCase.Label
+            $forceNativeGate = $gateCase.ForceNative
+            $expectedGate = $gateCase.ExpectedGate
             $startedSentinel =
                 Join-Path $tempRoot "posix-$gateLabel-started.txt"
             $survivedSentinel =
@@ -589,7 +771,11 @@ finally {
                 -StreamCompletionWaitMilliseconds 250 `
                 -StreamCleanupWaitMilliseconds 2000 `
                 -ForceNativePosixSessionGate:$forceNativeGate
-            if (-not $posixPipeResult.PipeLeakDetected -or
+            if ($posixPipeResult.PosixSessionGate -cne $expectedGate) {
+                Add-Failure "Expected POSIX $gateLabel containment to report gate '$expectedGate', got '$($posixPipeResult.PosixSessionGate)'."
+            }
+            if ($posixPipeResult.ExitCode -ne 0 -or
+                -not $posixPipeResult.PipeLeakDetected -or
                 $posixPipeResult.StreamsCompleted -or
                 -not $posixPipeResult.TreeStopped -or
                 $posixPipeResult.TimedOut -or
@@ -616,6 +802,9 @@ finally {
             [PrivateMarker.PosixSignal]::IsSuccessfulResult(-1, 1) -or
             [PrivateMarker.PosixSignal]::IsSuccessfulResult(-1, 13)) {
             Add-Failure 'Expected POSIX cleanup to accept success/ESRCH and reject EPERM/EACCES.'
+        }
+        if ($failures.Count -eq $posixFailureCountBefore) {
+            Write-Host "POSIX containment evidence: automatic=$automaticGate; forced=native-setsid; target-exit=0; descendant-started=true; descendant-stopped=true."
         }
     }
 
@@ -855,6 +1044,55 @@ public static class SyntheticGitProgram
                     Environment.GetEnvironmentVariable("PRIVATE_MARKER_INDEX_MUTATION_SENTINEL"),
                     "flags-mutated",
                     new UTF8Encoding(false));
+            }
+            return Run(realGit, args, 20000);
+        }
+
+        if (String.Equals(
+            Environment.GetEnvironmentVariable("PRIVATE_MARKER_SYNTHETIC_GIT_MODE"),
+            "root-alias",
+            StringComparison.Ordinal))
+        {
+            var realGit = Environment.GetEnvironmentVariable("PRIVATE_MARKER_REAL_GIT");
+            if (Array.IndexOf(args, "rev-parse") >= 0 &&
+                Array.IndexOf(args, "--show-toplevel") >= 0)
+            {
+                Console.Out.WriteLine(
+                    Environment.GetEnvironmentVariable("PRIVATE_MARKER_ROOT_ALIAS"));
+                return 0;
+            }
+            return Run(realGit, args, 20000);
+        }
+
+        if (String.Equals(
+            Environment.GetEnvironmentVariable("PRIVATE_MARKER_SYNTHETIC_GIT_MODE"),
+            "whitespace-prefix",
+            StringComparison.Ordinal))
+        {
+            var realGit = Environment.GetEnvironmentVariable("PRIVATE_MARKER_REAL_GIT");
+            if (Array.IndexOf(args, "rev-parse") >= 0 &&
+                Array.IndexOf(args, "--show-prefix") >= 0)
+            {
+                Console.Out.WriteLine("\u2003");
+                return 0;
+            }
+            return Run(realGit, args, 20000);
+        }
+
+        if (String.Equals(
+            Environment.GetEnvironmentVariable("PRIVATE_MARKER_SYNTHETIC_GIT_MODE"),
+            "bom-prefix",
+            StringComparison.Ordinal))
+        {
+            var realGit = Environment.GetEnvironmentVariable("PRIVATE_MARKER_REAL_GIT");
+            if (Array.IndexOf(args, "rev-parse") >= 0 &&
+                Array.IndexOf(args, "--show-prefix") >= 0)
+            {
+                var output = Console.OpenStandardOutput();
+                var bytes = new byte[] { 0xEF, 0xBB, 0xBF, 0x0A };
+                output.Write(bytes, 0, bytes.Length);
+                output.Flush();
+                return 0;
             }
             return Run(realGit, args, 20000);
         }
@@ -1487,8 +1725,87 @@ Add-Type `
         Add-Failure "Expected bounded target git init to succeed. Output: $($targetInit.Output.Trim())"
     }
 
+    # --show-prefix 単独では Git 管理 directory でも空を返せるため、
+    # 先行する --show-toplevel の worktree 証明を削除できないよう固定する。
+    $gitDirectoryResult = Invoke-Scanner `
+        -ScanPath (Join-Path $trackedRoot '.git')
+    if ($gitDirectoryResult.ExitCode -eq 0 -or
+        $gitDirectoryResult.Output -notmatch 'Git root probe failed closed') {
+        Add-Failure "Expected a Git administrative directory scan to fail closed. Output: $($gitDirectoryResult.Output.Trim())"
+    }
+
+    # Unicode 空白だけの directory 名も worktree root ではない。prefix の
+    # Trim / whitespace 許容へ退行して部分 scan を通さない。
+    $unicodeWhitespaceDirectory = Join-Path $trackedRoot ([string][char]0x2003)
+    New-Item -ItemType Directory -Path $unicodeWhitespaceDirectory | Out-Null
+    Set-Content `
+        -LiteralPath (Join-Path $unicodeWhitespaceDirectory 'clean.md') `
+        -Value 'synthetic clean Unicode whitespace subdirectory' `
+        -Encoding UTF8
+    $unicodeWhitespaceAdd = Invoke-HermeticGit `
+        -WorkingDirectory $trackedRoot `
+        -Arguments @('add', '--', ([string][char]0x2003 + '/clean.md')) `
+        -IsolationRoot $fixtureIsolationRoot
+    if ($unicodeWhitespaceAdd.ExitCode -ne 0) {
+        Add-Failure "Expected Unicode whitespace subdirectory setup to succeed. Output: $($unicodeWhitespaceAdd.Output.Trim())"
+    } else {
+        $unicodeWhitespaceResult = Invoke-Scanner `
+            -ScanPath $unicodeWhitespaceDirectory
+        if ($unicodeWhitespaceResult.ExitCode -eq 0 -or
+            $unicodeWhitespaceResult.Output -notmatch 'exact Git worktree root') {
+            Add-Failure "Expected a Unicode whitespace Git subdirectory scan to fail closed. Output: $($unicodeWhitespaceResult.Output.Trim())"
+        }
+    }
+
     if ((Test-PrivateMarkerWindowsHost) -and
         (Test-Path -LiteralPath $syntheticGitPath -PathType Leaf)) {
+        # macOS の /var と /private/var のように、Git が同じ worktree root を
+        # 別の物理 path 表記で返しても、文字列比較で subdirectory と誤判定しない。
+        $rootAliasResult = Invoke-Scanner `
+            -ScanPath $trackedRoot `
+            -EnvironmentOverrides @{
+                PATH = $syntheticGitDirectory
+                PRIVATE_MARKER_SYNTHETIC_GIT_MODE = 'root-alias'
+                PRIVATE_MARKER_REAL_GIT = (Get-Command git -ErrorAction Stop).Source
+                PRIVATE_MARKER_ROOT_ALIAS = (Join-Path $tempRoot 'reported root alias')
+            }
+        if ($rootAliasResult.ExitCode -ne 0 -or
+            -not $rootAliasResult.StreamsCompleted -or
+            -not $rootAliasResult.TreeStopped -or
+            $rootAliasResult.TimedOut -or
+            $rootAliasResult.OutputLimitExceeded -or
+            $rootAliasResult.PipeLeakDetected) {
+            Add-Failure "Expected a Git-reported physical root alias to remain accepted. Output: $($rootAliasResult.Output.Trim())"
+        }
+
+        # Prefix が Unicode 空白だけという不正応答も exact root とみなさない。
+        # strict な LF / CRLF 比較を Trim / IsNullOrWhiteSpace へ弱める退行を検出する。
+        $whitespacePrefixResult = Invoke-Scanner `
+            -ScanPath $trackedRoot `
+            -EnvironmentOverrides @{
+                PATH = $syntheticGitDirectory
+                PRIVATE_MARKER_SYNTHETIC_GIT_MODE = 'whitespace-prefix'
+                PRIVATE_MARKER_REAL_GIT = (Get-Command git -ErrorAction Stop).Source
+            }
+        if ($whitespacePrefixResult.ExitCode -eq 0 -or
+            $whitespacePrefixResult.Output -notmatch 'exact Git worktree root') {
+            Add-Failure "Expected a whitespace-only Git prefix to fail closed. Output: $($whitespacePrefixResult.Output.Trim())"
+        }
+
+        # UTF-8 decoder が BOM を除去しても、Git の raw prefix contract では
+        # BOM + LF を root の LF と同一視しない。
+        $bomPrefixResult = Invoke-Scanner `
+            -ScanPath $trackedRoot `
+            -EnvironmentOverrides @{
+                PATH = $syntheticGitDirectory
+                PRIVATE_MARKER_SYNTHETIC_GIT_MODE = 'bom-prefix'
+                PRIVATE_MARKER_REAL_GIT = (Get-Command git -ErrorAction Stop).Source
+            }
+        if ($bomPrefixResult.ExitCode -eq 0 -or
+            $bomPrefixResult.Output -notmatch 'exact Git worktree root') {
+            Add-Failure "Expected a BOM-prefixed Git prefix to fail closed. Output: $($bomPrefixResult.Output.Trim())"
+        }
+
         # final raw stage listing の直前に、実 index へ replacement と addition を
         # 同時適用し、開始 snapshot との差分を fail-closed で検出する。
         $indexMutationRoot = Join-Path $tempRoot 'index mutation target'

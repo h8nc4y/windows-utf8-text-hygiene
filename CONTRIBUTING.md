@@ -85,6 +85,21 @@ pwsh -NoProfile -File ./scripts/test-scan-private-markers.ps1
 pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 ```
 
+Platform results are not interchangeable. Windows verifies PowerShell 7,
+Windows PowerShell 5.1, and Job Object containment. Ubuntu verifies
+PowerShell 7 with the external `setsid` path plus a forced native
+`setsid(2)` case. The bounded macOS 15 job verifies PowerShell 7 and the
+native POSIX session fallback only; it does not provide PowerShell 5.1
+coverage. POSIX success requires the observed session gate, a zero target exit,
+and descendant start/cleanup evidence to agree with the host contract. A
+native gate failure may report only its fixed stage code; do not add raw paths
+or child output to CI diagnostics. The current measured macOS evidence is
+[run 30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010):
+PowerShell Core 7.6.3 on image `macos-15-arm64` version `20260715.0234.1`
+passed the full contract. Treat a runner-image, PowerShell-version, resolver,
+or timeout change as new evidence; do not generalize this result to an
+unmeasured environment.
+
 The scanner self-test includes a near-limit safe line and an adversarial
 one-million-character no-match line. The safe control must pass, while a
 regex timeout must finish inside the bounded process window, emit only the
