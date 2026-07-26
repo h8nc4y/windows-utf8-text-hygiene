@@ -77,9 +77,15 @@ The `validate-macos` job must:
 7. run the repository's private-marker scan; and
 8. check committed whitespace against the empty tree.
 
-The readiness validator compares the complete job block with this contract.
-Unknown or additional steps, alternate runners, missing shell declarations,
-or relaxed timeouts must fail validation.
+The readiness validator requires the canonical top-level workflow shape
+(`name: Validate`, `on:`, `permissions:`, then `jobs:`) and requires this block
+to be a direct child of that `jobs:` mapping. The direct job headings are also
+fixed to `validate`, `validate-ubuntu`, then `validate-macos`. It then compares
+the complete macOS job block with this contract. Relocating the unchanged block
+under another mapping, removing a heading, adding an alternate or duplicate
+root-level `jobs` definition or direct `validate-macos` definition, adding
+unknown steps, selecting another runner, omitting shell declarations, or
+relaxing timeouts must fail validation.
 
 The readiness mutation suite must also reject removal of the returned gate
 provenance, the observed-gate or target-exit assertion, the fixed POSIX

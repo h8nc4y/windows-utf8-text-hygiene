@@ -75,6 +75,130 @@ function Assert-FileDoesNotContain {
     }
 }
 
+function Test-WorkflowJobBlockExactContent {
+    param(
+        [string[]]$Lines,
+        [string]$JobName,
+        [string]$ExpectedBlock
+    )
+
+    # root key をcanonicalな4行だけに固定する。jobsを別表記で重複定義し、
+    # YAMLの後勝ち解釈で検証対象jobを無効化する形もfail closedにする。
+    $expectedTopLevelLines = @(
+        'name: Validate',
+        'on:',
+        'permissions:',
+        'jobs:'
+    )
+    $actualTopLevelLines = @()
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.TrimStart().StartsWith('#')) {
+            continue
+        }
+        if (-not $line.StartsWith(' ')) {
+            $actualTopLevelLines += $line
+        }
+    }
+    if ($actualTopLevelLines.Count -ne $expectedTopLevelLines.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedTopLevelLines.Count; $index++) {
+        if ($actualTopLevelLines[$index] -cne $expectedTopLevelLines[$index]) {
+            return $false
+        }
+    }
+
+    # canonical jobs mapping と job heading を各1件に固定する。block文字列が
+    # 別のtop-level mapping配下へ移されても、非実行jobを受理しない。
+    $jobsIndexes = @()
+    $heading = "  ${JobName}:"
+    $startIndexes = @()
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        if ($Lines[$index] -ceq 'jobs:') {
+            $jobsIndexes += $index
+        }
+        if ($Lines[$index] -ceq $heading) {
+            $startIndexes += $index
+        }
+    }
+    if ($jobsIndexes.Count -ne 1 -or $startIndexes.Count -ne 1) {
+        return $false
+    }
+
+    $jobsIndex = $jobsIndexes[0]
+    $jobsEndIndex = $Lines.Count - 1
+    for ($index = $jobsIndex + 1; $index -lt $Lines.Count; $index++) {
+        $line = $Lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.StartsWith('#')) {
+            continue
+        }
+        if (-not [char]::IsWhiteSpace($line[0])) {
+            $jobsEndIndex = $index - 1
+            break
+        }
+    }
+
+    # jobs mapping直下のjob IDもcanonicalな3行だけに固定する。引用符、
+    # colon前空白、explicit key等の同値な重複jobを後置して、完全一致した
+    # validate-macosをYAMLの後勝ちで無効化する形を受理しない。
+    $expectedJobHeadings = @(
+        '  validate:',
+        '  validate-ubuntu:',
+        '  validate-macos:'
+    )
+    $actualJobHeadings = @()
+    for ($index = $jobsIndex + 1; $index -le $jobsEndIndex; $index++) {
+        $line = $Lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.TrimStart().StartsWith('#')) {
+            continue
+        }
+        if (-not $line.StartsWith('  ')) {
+            return $false
+        }
+        if (-not $line.StartsWith('   ')) {
+            $actualJobHeadings += $line
+        }
+    }
+    if ($actualJobHeadings.Count -ne $expectedJobHeadings.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedJobHeadings.Count; $index++) {
+        if ($actualJobHeadings[$index] -cne $expectedJobHeadings[$index]) {
+            return $false
+        }
+    }
+
+    $startIndex = $startIndexes[0]
+    if ($startIndex -le $jobsIndex -or $startIndex -gt $jobsEndIndex) {
+        return $false
+    }
+
+    # jobs mapping 内の次の同階層job直前までを閉じた契約として比較する。
+    $endIndex = $jobsEndIndex
+    for ($index = $startIndex + 1; $index -le $jobsEndIndex; $index++) {
+        $line = $Lines[$index]
+        if ($line.StartsWith('  ') -and
+            -not $line.StartsWith('   ') -and
+            $line.EndsWith(':')) {
+            $endIndex = $index - 1
+            break
+        }
+    }
+
+    $trimCharacters = [char[]]@("`r", "`n")
+    $actualBlock = (
+        @($Lines[$startIndex..$endIndex]) -join "`n"
+    ).TrimEnd($trimCharacters)
+    $normalizedExpected = $ExpectedBlock.Replace(
+        "`r`n",
+        "`n"
+    ).TrimEnd($trimCharacters)
+    return $actualBlock -ceq $normalizedExpected
+}
+
 function Assert-WorkflowJobBlockExact {
     param(
         [string]$RelativePath,
@@ -88,42 +212,157 @@ function Assert-WorkflowJobBlockExact {
         return
     }
 
-    # job headingを一意に特定し、次の同階層job直前までを閉じた契約として比較する。
     $lines = @(Get-Content -LiteralPath $filePath)
-    $heading = "  ${JobName}:"
-    $startIndexes = @()
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ($lines[$index] -ceq $heading) {
-            $startIndexes += $index
-        }
+    if (-not (Test-WorkflowJobBlockExactContent `
+            -Lines $lines `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock)) {
+        Add-Failure "Workflow job '$JobName' failed its exact block contract."
     }
-    if ($startIndexes.Count -ne 1) {
-        Add-Failure "Workflow job '$JobName' must appear exactly once (found $($startIndexes.Count))."
+}
+
+function Assert-WorkflowJobBlockValidatorRegressions {
+    param(
+        [string]$RelativePath,
+        [string]$JobName,
+        [string]$ExpectedBlock
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
         return
     }
 
-    $startIndex = $startIndexes[0]
-    $endIndex = $lines.Count - 1
-    for ($index = $startIndex + 1; $index -lt $lines.Count; $index++) {
-        $line = $lines[$index]
-        if ($line.StartsWith('  ') -and
-            -not $line.StartsWith('   ') -and
-            $line.EndsWith(':')) {
-            $endIndex = $index - 1
-            break
-        }
+    $lines = @(Get-Content -LiteralPath $filePath)
+    if (-not (Test-WorkflowJobBlockExactContent `
+            -Lines $lines `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock)) {
+        return
     }
 
     $trimCharacters = [char[]]@("`r", "`n")
-    $actualBlock = (
-        @($lines[$startIndex..$endIndex]) -join "`n"
-    ).TrimEnd($trimCharacters)
+    $workflowText = ($lines -join "`n").TrimEnd($trimCharacters)
     $normalizedExpected = $ExpectedBlock.Replace(
         "`r`n",
         "`n"
     ).TrimEnd($trimCharacters)
-    if ($actualBlock -cne $normalizedExpected) {
-        Add-Failure "Workflow job '$JobName' failed its exact block contract."
+    $targetOffset = $workflowText.IndexOf(
+        $normalizedExpected,
+        [System.StringComparison]::Ordinal
+    )
+    $jobsMarker = "jobs:`n"
+    $jobsOffset = $workflowText.IndexOf(
+        $jobsMarker,
+        [System.StringComparison]::Ordinal
+    )
+    if ($targetOffset -lt 0 -or
+        $targetOffset -ne $workflowText.LastIndexOf(
+            $normalizedExpected,
+            [System.StringComparison]::Ordinal
+        ) -or
+        $jobsOffset -lt 0) {
+        Add-Failure 'Workflow job membership mutation fixture could not be constructed.'
+        return
+    }
+
+    $withoutTarget = $workflowText.Remove(
+        $targetOffset,
+        $normalizedExpected.Length
+    )
+    $relocatedBlock = (
+        "ignored-contract-fixture:`n" +
+        $normalizedExpected +
+        "`n  sibling-delimiter:`n`n"
+    )
+    $relocatedText = $withoutTarget.Insert($jobsOffset, $relocatedBlock)
+    $relocatedLines = $relocatedText.Split(
+        [string[]]@("`n"),
+        [System.StringSplitOptions]::None
+    )
+    if (Test-WorkflowJobBlockExactContent `
+            -Lines $relocatedLines `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock) {
+        Add-Failure 'Workflow job validator accepted a block outside top-level jobs.'
+    }
+
+    $renamedJobsText = $workflowText.Replace(
+        $jobsMarker,
+        "ignored-jobs:`n"
+    )
+    if ($renamedJobsText -ceq $workflowText) {
+        Add-Failure 'Workflow jobs-heading mutation was ineffective.'
+    } elseif (Test-WorkflowJobBlockExactContent `
+            -Lines $renamedJobsText.Split(
+                [string[]]@("`n"),
+                [System.StringSplitOptions]::None
+            ) `
+            -JobName $JobName `
+            -ExpectedBlock $ExpectedBlock) {
+        Add-Failure 'Workflow job validator accepted a missing top-level jobs mapping.'
+    }
+
+    # YAMLで同じroot keyを表せる別構文を追加し、後勝ちで有効なjobs mappingを
+    # 空にできる形をすべて拒否する。文字列比較だけのjobs件数確認へ戻さない。
+    $alternateJobsDefinitions = @(
+        'jobs: {}',
+        'jobs : {}',
+        '"jobs": {}',
+        "'jobs': {}",
+        "? jobs`n: {}"
+    )
+    foreach ($alternateJobsDefinition in $alternateJobsDefinitions) {
+        $duplicateJobsText = (
+            $workflowText +
+            "`n" +
+            $alternateJobsDefinition
+        )
+        if ($duplicateJobsText -ceq $workflowText) {
+            Add-Failure 'Workflow duplicate-jobs mutation was ineffective.'
+            continue
+        }
+        $duplicateJobsLines = $duplicateJobsText.Split(
+            [string[]]@("`n"),
+            [System.StringSplitOptions]::None
+        )
+        if (Test-WorkflowJobBlockExactContent `
+                -Lines $duplicateJobsLines `
+                -JobName $JobName `
+                -ExpectedBlock $ExpectedBlock) {
+            Add-Failure 'Workflow job validator accepted an alternate top-level jobs definition.'
+        }
+    }
+
+    # 対象jobのcanonical block直後に同値な別表記を置く。次jobの境界として
+    # 単に除外する実装ではなく、jobs直下の見出し集合自体が拒否する必要がある。
+    $alternateTargetDefinitions = @(
+        "  ${JobName}: { if: false, runs-on: ubuntu-latest }",
+        "  ${JobName} : { if: false, runs-on: ubuntu-latest }",
+        "  `"${JobName}`":`n    if: false`n    runs-on: ubuntu-latest",
+        "  '${JobName}':`n    if: false`n    runs-on: ubuntu-latest",
+        "  ? ${JobName}`n  :`n    if: false`n    runs-on: ubuntu-latest"
+    )
+    foreach ($alternateTargetDefinition in $alternateTargetDefinitions) {
+        $duplicateTargetText = (
+            $workflowText +
+            "`n" +
+            $alternateTargetDefinition
+        )
+        if ($duplicateTargetText -ceq $workflowText) {
+            Add-Failure 'Workflow duplicate-target mutation was ineffective.'
+            continue
+        }
+        $duplicateTargetLines = $duplicateTargetText.Split(
+            [string[]]@("`n"),
+            [System.StringSplitOptions]::None
+        )
+        if (Test-WorkflowJobBlockExactContent `
+                -Lines $duplicateTargetLines `
+                -JobName $JobName `
+                -ExpectedBlock $ExpectedBlock) {
+            Add-Failure 'Workflow job validator accepted an alternate duplicate target job.'
+        }
     }
 }
 
@@ -1832,6 +2071,8 @@ Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?i
 Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'macos-15-arm64.*20260715\.0234\.1' -Description 'documented macOS runner image evidence'
 Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'PowerShell Core\s+`7\.6\.3`' -Description 'documented macOS PowerShell evidence'
 Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'job/89802443609' -Description 'documented macOS job evidence'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?s)canonical top-level workflow shape.*direct child of that `jobs:`' -Description 'documented workflow shape and job membership contract'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?s)direct job headings.*`validate-ubuntu`.*`validate-macos`' -Description 'documented canonical direct job headings'
 Assert-FileDoesNotContain -RelativePath 'README.md' -Pattern 'job is being added|macOS remains unverified until' -Description 'stale pre-CI macOS limitation'
 Assert-FileDoesNotContain -RelativePath 'SECURITY.md' -Pattern 'until its pull-request run succeeds|macOS behavior remains\s+unverified' -Description 'stale pre-CI macOS security limitation'
 Assert-FileDoesNotContain -RelativePath 'CONTRIBUTING.md' -Pattern 'Until that pull-request job is green' -Description 'stale pre-CI contributor limitation'
@@ -1888,6 +2129,10 @@ $expectedMacOsWorkflowJob = @'
         run: git diff-tree --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
 '@
 Assert-WorkflowJobBlockExact `
+    -RelativePath '.github/workflows/validate.yml' `
+    -JobName 'validate-macos' `
+    -ExpectedBlock $expectedMacOsWorkflowJob
+Assert-WorkflowJobBlockValidatorRegressions `
     -RelativePath '.github/workflows/validate.yml' `
     -JobName 'validate-macos' `
     -ExpectedBlock $expectedMacOsWorkflowJob
