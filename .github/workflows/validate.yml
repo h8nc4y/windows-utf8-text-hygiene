@@ -68,3 +68,40 @@ jobs:
       - name: Check whitespace
         shell: pwsh
         run: git diff-tree --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
+
+  validate-macos:
+    name: Validate macOS PowerShell 7
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Verify macOS and PowerShell Core
+        shell: pwsh
+        run: |
+          if (-not $IsMacOS) {
+            throw 'Expected a macOS host.'
+          }
+          if ($PSVersionTable.PSEdition -cne 'Core') {
+            throw 'Expected PowerShell Core.'
+          }
+          if ($PSVersionTable.PSVersion.Major -ne 7) {
+            throw 'Expected PowerShell 7.'
+          }
+
+      - name: Validate OSS readiness
+        shell: pwsh
+        run: ./scripts/validate-oss-readiness.ps1
+
+      - name: Test private marker scan (PowerShell 7 on macOS)
+        shell: pwsh
+        run: ./scripts/test-scan-private-markers.ps1
+
+      - name: Scan for private markers
+        shell: pwsh
+        run: ./scripts/scan-private-markers.ps1
+
+      - name: Check whitespace
+        shell: pwsh
+        run: git diff-tree --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD

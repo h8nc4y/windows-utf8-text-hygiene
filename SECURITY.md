@@ -64,6 +64,21 @@ On Windows, the requested executable is created suspended with a
 three-handle standard-I/O allowlist, assigned to a kill-on-close Job, and
 resumed only after assignment. This closes the start-before-assignment
 descendant race.
+On POSIX, the requested executable starts in a dedicated session/process
+group before its first instruction, and cleanup targets the whole group.
+Ubuntu exercises both its external `setsid` path and a forced native
+`setsid(2)` case. The macOS 15 job uses PowerShell 7 only and exercises the
+native fallback; until its pull-request run succeeds, macOS behavior remains
+unverified. The helper reports the selected POSIX gate, while the self-test
+requires that report, a zero target exit, descendant-start evidence, and
+post-cleanup absence. Native `setsid(2)` and `kill(2)` calls use the POSIX
+runtime's `libc` resolver. A bounded, strict-UTF-8 status channel maps native
+handshake failures to fixed stage codes; it never reflects a status path,
+arbitrary child text, or raw stdout/stderr. Launch, handshake, and target
+execution share the caller's timeout. Elapsed-only checks before tree stop and
+after stream/handle cleanup reject a deadline overrun even when the direct
+child already exited zero. Neither POSIX job substitutes for the Windows Job
+Object or PowerShell 5.1 contracts.
 Ambient repository redirects (`GIT_DIR`, worktree/index/object variables),
 config injection, hooks, attributes, excludes, templates, filters, prompts,
 and trace settings are not inherited by those Git children. Promisor-remote

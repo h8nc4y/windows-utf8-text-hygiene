@@ -8,6 +8,19 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Added a bounded `macos-15` PowerShell 7 CI contract for the native POSIX
+  session fallback. macOS execution remains unverified until the new
+  pull-request job completes successfully; Windows PowerShell 5.1 remains a
+  separate Windows-only contract.
+- Made POSIX containment evidence fail closed on the observed session gate,
+  target exit code, descendant start, and descendant cleanup. Native
+  `setsid(2)` and `kill(2)` imports continue to use the POSIX runtime's
+  established `libc` resolver.
+- Added bounded, allowlisted native-gate stage diagnostics and made process
+  launch, the gate handshake, and target execution share the existing caller
+  timeout. Elapsed-only pre-cleanup and final checks reject already-exited
+  zero-code children after setup or cleanup overruns. The PowerShell wrapper
+  also avoids the read-only `$IsMacOS` automatic-variable name.
 - Hardened private-marker scanning so Git file enumeration runs in bounded,
   hermetic child processes. Ambient `GIT_*`, home/config, hooks, attributes,
   excludes, templates, filters, prompts, and trace settings can no longer

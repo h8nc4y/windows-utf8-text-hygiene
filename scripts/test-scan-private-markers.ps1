@@ -492,13 +492,195 @@ $stream.Flush()
         Add-Failure 'Expected hostile nonexistent scan paths to emit exactly one fixed stderr code plus the platform newline.'
     }
 
+    # native wrapperはPowerShell 7のread-only `$IsMacOS` と
+    # case-insensitiveに衝突する名前へ代入してはならない。
+    $processBoundarySource = [System.IO.File]::ReadAllText($processBoundary)
+    if ($processBoundarySource -cmatch '(?im)^\s*\$IsMacOS\s*=') {
+        Add-Failure 'Expected the native POSIX wrapper to avoid the read-only IsMacOS automatic variable.'
+    }
+
+    # child statusは固定allowlistだけを親例外へ変換し、任意文字列やpathを
+    # CI logへ反射しない。errnoも有限桁のdecimalだけを許可する。
+    $posixGateFailureReasonCases = @(
+        [pscustomobject]@{ Status = 'compile'; Expected = 'compile' },
+        [pscustomobject]@{
+            Status = 'setsid-library'
+            Expected = 'setsid-library'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-entrypoint'
+            Expected = 'setsid-entrypoint'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-call'
+            Expected = 'setsid-call'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-error-1'
+            Expected = 'setsid-error-1'
+        },
+        [pscustomobject]@{
+            Status = 'ready-prepare'
+            Expected = 'ready-prepare'
+        },
+        [pscustomobject]@{
+            Status = 'ready-write'
+            Expected = 'ready-write'
+        },
+        [pscustomobject]@{
+            Status = 'setsid-error-123456'
+            Expected = 'unknown'
+        },
+        [pscustomobject]@{
+            Status = 'synthetic-sensitive-value'
+            Expected = 'unknown'
+        }
+    )
+    foreach ($reasonCase in $posixGateFailureReasonCases) {
+        $actualReason = ConvertTo-PrivateMarkerPosixGateFailureReason `
+            -Status $reasonCase.Status
+        if ($actualReason -cne $reasonCase.Expected) {
+            Add-Failure 'Expected POSIX gate status to map to its fixed allowlisted reason.'
+        }
+    }
+
+    $posixStatusReadFixture =
+        Join-Path $tempRoot 'synthetic-posix-gate-status'
+    $posixStatusReadCases = @(
+        [pscustomobject]@{
+            Label = 'known'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes('compile')
+            ExpectedText = 'compile'
+            ExpectedReason = 'compile'
+        },
+        [pscustomobject]@{
+            Label = '65-byte-rejection'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes(('x' * 65))
+            ExpectedText = ''
+            ExpectedReason = 'unknown'
+        },
+        [pscustomobject]@{
+            Label = 'invalid-utf8'
+            Bytes = [byte[]]@(0xC3, 0x28)
+            ExpectedText = ''
+            ExpectedReason = 'unknown'
+        },
+        [pscustomobject]@{
+            Label = 'synthetic-sensitive-content'
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes(
+                '<local-path>/synthetic-sensitive-value'
+            )
+            ExpectedText = '<local-path>/synthetic-sensitive-value'
+            ExpectedReason = 'unknown'
+        }
+    )
+    foreach ($statusReadCase in $posixStatusReadCases) {
+        try {
+            [System.IO.File]::WriteAllBytes(
+                $posixStatusReadFixture,
+                [byte[]]$statusReadCase.Bytes
+            )
+            $actualStatusText =
+                Read-PrivateMarkerPosixGateStatus `
+                    -Path $posixStatusReadFixture
+            $actualStatusReason =
+                ConvertTo-PrivateMarkerPosixGateFailureReason `
+                    -Status $actualStatusText
+            if ($actualStatusText -cne $statusReadCase.ExpectedText -or
+                $actualStatusReason -cne $statusReadCase.ExpectedReason) {
+                Add-Failure 'Expected bounded POSIX status input to produce only its fixed result.'
+            }
+        }
+        finally {
+            if ([System.IO.File]::Exists($posixStatusReadFixture)) {
+                [System.IO.File]::Delete($posixStatusReadFixture)
+            }
+        }
+    }
+
+    # childは0で即時終了させ、終了確認後だけself-test seamでdeadlineを
+    # 消費する。旧「未終了かつ期限超過」条件のfalse-greenを直接測る。
+    $instantExitExecutable = if (Test-PrivateMarkerWindowsHost) {
+        [Environment]::GetEnvironmentVariable('ComSpec', 'Process')
+    } else {
+        '/bin/sh'
+    }
+    if ([string]::IsNullOrWhiteSpace($instantExitExecutable) -or
+        -not (Test-Path -LiteralPath $instantExitExecutable -PathType Leaf)) {
+        Add-Failure 'Expected an absolute native shell for the post-exit deadline regression.'
+    } else {
+        $instantExitArguments = if (Test-PrivateMarkerWindowsHost) {
+            @('/d', '/c', 'exit 0')
+        } else {
+            @('-c', 'exit 0')
+        }
+        $expiredCompletedProcessResult = Invoke-PrivateMarkerProcess `
+            -FileName $instantExitExecutable `
+            -Arguments $instantExitArguments `
+            -WorkingDirectory $tempRoot `
+            -TimeoutMilliseconds 5000 `
+            -TestOnlyPostExitDelayMilliseconds 5100
+        if (-not $expiredCompletedProcessResult.TimedOut -or
+            $expiredCompletedProcessResult.ExitCode -ne 0 -or
+            $expiredCompletedProcessResult.OutputLimitExceeded -or
+            $expiredCompletedProcessResult.InputWriteFailed -or
+            $expiredCompletedProcessResult.PipeLeakDetected -or
+            -not $expiredCompletedProcessResult.StreamsCompleted -or
+            -not $expiredCompletedProcessResult.TreeStopped) {
+            Add-Failure 'Expected the post-exit setup deadline to reject an already exited zero-code child.'
+        }
+
+        # 初回検査を期限内に通し、stream回収後だけ残時間を消費する。
+        # cleanup後のelapsed-only再検査が無い旧実装を独立に赤へする。
+        $expiredAfterInitialCheckResult = Invoke-PrivateMarkerProcess `
+            -FileName $instantExitExecutable `
+            -Arguments $instantExitArguments `
+            -WorkingDirectory $tempRoot `
+            -TimeoutMilliseconds 5000 `
+            -TestOnlyExpireDeadlineAfterInitialCheck
+        if (-not $expiredAfterInitialCheckResult.TimedOut -or
+            $expiredAfterInitialCheckResult.ExitCode -ne 0 -or
+            $expiredAfterInitialCheckResult.OutputLimitExceeded -or
+            $expiredAfterInitialCheckResult.InputWriteFailed -or
+            $expiredAfterInitialCheckResult.PipeLeakDetected -or
+            -not $expiredAfterInitialCheckResult.StreamsCompleted -or
+            -not $expiredAfterInitialCheckResult.TreeStopped) {
+            Add-Failure 'Expected the post-stream cleanup deadline to reject a zero-code child.'
+        }
+    }
+
     if (-not (Test-PrivateMarkerWindowsHost)) {
         # direct parentが終了済みでも、同じprocess groupの孫をsignalして
         # inherited pipeと遅延sentinelの両方を確実に閉じる。
+        $posixFailureCountBefore = $failures.Count
+        $externalSetsidPath = @('/usr/bin/setsid', '/bin/setsid') |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+        $automaticGate = if (
+            [string]::IsNullOrWhiteSpace($externalSetsidPath)
+        ) {
+            'native-setsid'
+        } else {
+            'external-setsid'
+        }
         $posixSurvivedSentinels =
             New-Object System.Collections.Generic.List[string]
-        foreach ($forceNativeGate in @($false, $true)) {
-            $gateLabel = if ($forceNativeGate) { 'native' } else { 'setsid' }
+        $posixGateCases = @(
+            [pscustomobject]@{
+                Label = 'automatic'
+                ForceNative = $false
+                ExpectedGate = $automaticGate
+            },
+            [pscustomobject]@{
+                Label = 'forced-native'
+                ForceNative = $true
+                ExpectedGate = 'native-setsid'
+            }
+        )
+        foreach ($gateCase in $posixGateCases) {
+            $gateLabel = $gateCase.Label
+            $forceNativeGate = $gateCase.ForceNative
+            $expectedGate = $gateCase.ExpectedGate
             $startedSentinel =
                 Join-Path $tempRoot "posix-$gateLabel-started.txt"
             $survivedSentinel =
@@ -589,7 +771,11 @@ finally {
                 -StreamCompletionWaitMilliseconds 250 `
                 -StreamCleanupWaitMilliseconds 2000 `
                 -ForceNativePosixSessionGate:$forceNativeGate
-            if (-not $posixPipeResult.PipeLeakDetected -or
+            if ($posixPipeResult.PosixSessionGate -cne $expectedGate) {
+                Add-Failure "Expected POSIX $gateLabel containment to report gate '$expectedGate', got '$($posixPipeResult.PosixSessionGate)'."
+            }
+            if ($posixPipeResult.ExitCode -ne 0 -or
+                -not $posixPipeResult.PipeLeakDetected -or
                 $posixPipeResult.StreamsCompleted -or
                 -not $posixPipeResult.TreeStopped -or
                 $posixPipeResult.TimedOut -or
@@ -616,6 +802,9 @@ finally {
             [PrivateMarker.PosixSignal]::IsSuccessfulResult(-1, 1) -or
             [PrivateMarker.PosixSignal]::IsSuccessfulResult(-1, 13)) {
             Add-Failure 'Expected POSIX cleanup to accept success/ESRCH and reject EPERM/EACCES.'
+        }
+        if ($failures.Count -eq $posixFailureCountBefore) {
+            Write-Host "POSIX containment evidence: automatic=$automaticGate; forced=native-setsid; target-exit=0; descendant-started=true; descendant-stopped=true."
         }
     }
 

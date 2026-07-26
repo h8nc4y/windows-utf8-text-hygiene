@@ -56,6 +56,417 @@ function Assert-FileContains {
     }
 }
 
+function Assert-WorkflowJobBlockExact {
+    param(
+        [string]$RelativePath,
+        [string]$JobName,
+        [string]$ExpectedBlock
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath (exact workflow job '$JobName')"
+        return
+    }
+
+    # job headingを一意に特定し、次の同階層job直前までを閉じた契約として比較する。
+    $lines = @(Get-Content -LiteralPath $filePath)
+    $heading = "  ${JobName}:"
+    $startIndexes = @()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -ceq $heading) {
+            $startIndexes += $index
+        }
+    }
+    if ($startIndexes.Count -ne 1) {
+        Add-Failure "Workflow job '$JobName' must appear exactly once (found $($startIndexes.Count))."
+        return
+    }
+
+    $startIndex = $startIndexes[0]
+    $endIndex = $lines.Count - 1
+    for ($index = $startIndex + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line.StartsWith('  ') -and
+            -not $line.StartsWith('   ') -and
+            $line.EndsWith(':')) {
+            $endIndex = $index - 1
+            break
+        }
+    }
+
+    $trimCharacters = [char[]]@("`r", "`n")
+    $actualBlock = (
+        @($lines[$startIndex..$endIndex]) -join "`n"
+    ).TrimEnd($trimCharacters)
+    $normalizedExpected = $ExpectedBlock.Replace(
+        "`r`n",
+        "`n"
+    ).TrimEnd($trimCharacters)
+    if ($actualBlock -cne $normalizedExpected) {
+        Add-Failure "Workflow job '$JobName' failed its exact block contract."
+    }
+}
+
+function Get-OrdinalFragmentCount {
+    param(
+        [string]$Content,
+        [string]$Fragment
+    )
+
+    if ([string]::IsNullOrEmpty($Fragment)) {
+        return 0
+    }
+
+    $count = 0
+    $offset = 0
+    while ($offset -lt $Content.Length) {
+        $index = $Content.IndexOf(
+            $Fragment,
+            $offset,
+            [System.StringComparison]::Ordinal
+        )
+        if ($index -lt 0) {
+            break
+        }
+        $count++
+        $offset = $index + $Fragment.Length
+    }
+    return $count
+}
+
+function Test-PosixContainmentEvidenceContract {
+    param(
+        [string]$ProcessSource,
+        [string]$SelfTestSource
+    )
+
+    $processFragments = @(
+        @{ Text = 'PosixSessionGate = $posixSessionGate'; Count = 1 },
+        @{ Text = '$posixSessionGate = ''external-setsid'''; Count = 1 },
+        @{ Text = '$posixSessionGate = ''native-setsid'''; Count = 1 },
+        @{
+            Text = '[DllImport("libc", SetLastError = true)]'
+            Count = 2
+        },
+        @{
+            Text = 'function ConvertTo-PrivateMarkerPosixGateFailureReason'
+            Count = 1
+        },
+        @{
+            Text = 'function Read-PrivateMarkerPosixGateStatus'
+            Count = 1
+        },
+        @{
+            Text = 'Join-Path $gateRoot "private-marker-posix-status-$gateId"'
+            Count = 1
+        },
+        @{ Text = 'Write-NativeGateStatus ''compile'''; Count = 1 },
+        @{ Text = 'Write-NativeGateStatus ''setsid-call'''; Count = 2 },
+        @{ Text = 'Write-NativeGateStatus ''ready-prepare'''; Count = 1 },
+        @{ Text = 'Write-NativeGateStatus ''ready-write'''; Count = 1 },
+        @{ Text = '-Path $posixGateStatusPath'; Count = 1 },
+        @{ Text = '-Status $posixGateStatus'; Count = 1 },
+        @{ Text = '[PrivateMarker.NativePosixSession]::Create()'; Count = 1 },
+        @{ Text = 'New-Object byte[] 65'; Count = 1 },
+        @{ Text = '$statusLength -gt 64'; Count = 1 },
+        @{ Text = 'New-Object System.Text.UTF8Encoding($false, $true)'; Count = 1 },
+        @{ Text = '$TestOnlyPostExitDelayMilliseconds = 0'; Count = 1 },
+        @{ Text = '$TestOnlyExpireDeadlineAfterInitialCheck'; Count = 3 },
+        @{
+            Text = 'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {'
+            Count = 2
+        },
+        @{
+            Text = '$clock.ElapsedMilliseconds -lt $TimeoutMilliseconds'
+            Count = 3
+        }
+    )
+    foreach ($fragment in $processFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $ProcessSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+
+    $clockStartOffset = $ProcessSource.IndexOf(
+        '$clock = [System.Diagnostics.Stopwatch]::StartNew()',
+        [System.StringComparison]::Ordinal
+    )
+    $windowsLaunchOffset = $ProcessSource.IndexOf(
+        '$containedProcess = [PrivateMarker.ContainedProcess]::Start(',
+        [System.StringComparison]::Ordinal
+    )
+    $posixLaunchOffset = $ProcessSource.IndexOf(
+        '$processStarted = $process.Start()',
+        [System.StringComparison]::Ordinal
+    )
+    $firstElapsedDeadlineOffset = $ProcessSource.IndexOf(
+        'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {',
+        [System.StringComparison]::Ordinal
+    )
+    $finalElapsedDeadlineOffset = $ProcessSource.LastIndexOf(
+        'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {',
+        [System.StringComparison]::Ordinal
+    )
+    $treeStopOffset = $ProcessSource.IndexOf(
+        '$needsTreeStop = $timedOut -or',
+        [System.StringComparison]::Ordinal
+    )
+    $streamsCompletedOffset = $ProcessSource.IndexOf(
+        '$streamsCompleted = $null -ne $stdoutTask',
+        [System.StringComparison]::Ordinal
+    )
+    if ($clockStartOffset -lt 0 -or
+        $windowsLaunchOffset -lt 0 -or
+        $posixLaunchOffset -lt 0 -or
+        $firstElapsedDeadlineOffset -lt 0 -or
+        $finalElapsedDeadlineOffset -le $firstElapsedDeadlineOffset -or
+        $treeStopOffset -lt 0 -or
+        $streamsCompletedOffset -lt 0 -or
+        $clockStartOffset -ge $windowsLaunchOffset -or
+        $clockStartOffset -ge $posixLaunchOffset -or
+        $firstElapsedDeadlineOffset -ge $treeStopOffset -or
+        $finalElapsedDeadlineOffset -ge $streamsCompletedOffset) {
+        return $false
+    }
+
+    if ($ProcessSource -match '(?im)^\s*\$IsMacOS\s*=') {
+        return $false
+    }
+
+    $selfTestFragments = @(
+        @{
+            Text = '$posixPipeResult.PosixSessionGate -cne $expectedGate'
+            Count = 1
+        },
+        @{ Text = '$posixPipeResult.ExitCode -ne 0'; Count = 1 },
+        @{ Text = 'ExpectedGate = $automaticGate'; Count = 1 },
+        @{ Text = 'ExpectedGate = ''native-setsid'''; Count = 1 },
+        @{
+            Text = 'if ($failures.Count -eq $posixFailureCountBefore) {'
+            Count = 1
+        },
+        @{ Text = '$posixGateFailureReasonCases = @('; Count = 1 },
+        @{ Text = 'synthetic-sensitive-content'; Count = 1 },
+        @{
+            Text = 'post-exit setup deadline to reject an already exited zero-code child'
+            Count = 1
+        },
+        @{
+            Text = 'post-stream cleanup deadline to reject a zero-code child'
+            Count = 1
+        },
+        @{
+            Text = 'read-only IsMacOS automatic variable'
+            Count = 1
+        },
+        @{
+            Text = 'POSIX containment evidence: automatic=$automaticGate; forced=native-setsid; target-exit=0; descendant-started=true; descendant-stopped=true.'
+            Count = 1
+        }
+    )
+    foreach ($fragment in $selfTestFragments) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $SelfTestSource `
+                -Fragment $fragment.Text) -ne $fragment.Count) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-PosixContainmentEvidenceValidatorRegressions {
+    param(
+        [string]$ProcessRelativePath,
+        [string]$SelfTestRelativePath
+    )
+
+    $processPath = Get-RepoFilePath -RelativePath $ProcessRelativePath
+    $selfTestPath = Get-RepoFilePath -RelativePath $SelfTestRelativePath
+    if (-not (Test-Path -LiteralPath $processPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $selfTestPath -PathType Leaf)) {
+        Add-Failure 'Cannot inspect missing POSIX containment contract source.'
+        return
+    }
+
+    $processSource = Get-Content -LiteralPath $processPath -Raw
+    $selfTestSource = Get-Content -LiteralPath $selfTestPath -Raw
+    if (-not (Test-PosixContainmentEvidenceContract `
+            -ProcessSource $processSource `
+            -SelfTestSource $selfTestSource)) {
+        Add-Failure 'POSIX containment gate provenance, exit evidence, diagnostic, or native resolver contract is incomplete.'
+        return
+    }
+
+    $mutations = @(
+        [pscustomobject]@{
+            Name = 'returned gate provenance'
+            ProcessSource = $processSource.Replace(
+                'PosixSessionGate = $posixSessionGate',
+                'GateEvidenceRemoved = $posixSessionGate'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'external gate provenance'
+            ProcessSource = $processSource.Replace(
+                '$posixSessionGate = ''external-setsid''',
+                '$posixSessionGate = ''unknown-external-gate'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'native gate provenance'
+            ProcessSource = $processSource.Replace(
+                '$posixSessionGate = ''native-setsid''',
+                '$posixSessionGate = ''unknown-native-gate'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'Linux native library'
+            ProcessSource = $processSource.Replace(
+                '"libc"',
+                '"missing-linux-native-library"'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'automatic variable collision'
+            ProcessSource = $processSource + (
+                [Environment]::NewLine + '$IsMacOS = $true'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'fixed gate diagnostic mapper'
+            ProcessSource = $processSource.Replace(
+                'function ConvertTo-PrivateMarkerPosixGateFailureReason',
+                'function ConvertTo-RemovedPosixGateFailureReason'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'bounded gate diagnostic reader'
+            ProcessSource = $processSource.Replace(
+                'function Read-PrivateMarkerPosixGateStatus',
+                'function Read-RemovedPosixGateStatus'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'gate diagnostic status channel'
+            ProcessSource = $processSource.Replace(
+                'Join-Path $gateRoot "private-marker-posix-status-$gateId"',
+                'Join-Path $gateRoot "removed-posix-status-$gateId"'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'compile stage diagnostic'
+            ProcessSource = $processSource.Replace(
+                'Write-NativeGateStatus ''compile''',
+                'Write-NativeGateStatus ''removed-compile-stage'''
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'parent gate diagnostic read'
+            ProcessSource = $processSource.Replace(
+                '-Path $posixGateStatusPath',
+                '-Path $null'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'shared handshake deadline'
+            ProcessSource = $processSource.Replace(
+                '$clock.ElapsedMilliseconds -lt $TimeoutMilliseconds',
+                '$true'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'elapsed-only success deadlines'
+            ProcessSource = $processSource.Replace(
+                'if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) {',
+                'if ($false) {'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'post-exit deadline regression seam'
+            ProcessSource = $processSource.Replace(
+                '$TestOnlyPostExitDelayMilliseconds = 0',
+                '$RemovedPostExitDelayMilliseconds = 0'
+            )
+            SelfTestSource = $selfTestSource
+        },
+        [pscustomobject]@{
+            Name = 'observed gate assertion'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$posixPipeResult.PosixSessionGate -cne $expectedGate',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'automatic gate expectation'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'ExpectedGate = $automaticGate',
+                'ExpectedGate = ''unchecked-automatic-gate'''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'forced native gate expectation'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'ExpectedGate = ''native-setsid''',
+                'ExpectedGate = ''unchecked-forced-gate'''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'target exit assertion'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                '$posixPipeResult.ExitCode -ne 0',
+                '$false'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'evidence success guard'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'if ($failures.Count -eq $posixFailureCountBefore) {',
+                'if ($true) {'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'fixed POSIX evidence'
+            ProcessSource = $processSource
+            SelfTestSource = $selfTestSource.Replace(
+                'POSIX containment evidence:',
+                'POSIX evidence removed:'
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if ($mutation.ProcessSource -ceq $processSource -and
+            $mutation.SelfTestSource -ceq $selfTestSource) {
+            Add-Failure "POSIX containment validator mutation was ineffective: $($mutation.Name)"
+            continue
+        }
+        if (Test-PosixContainmentEvidenceContract `
+                -ProcessSource $mutation.ProcessSource `
+                -SelfTestSource $mutation.SelfTestSource) {
+            Add-Failure "POSIX containment validator accepted mutation: $($mutation.Name)"
+        }
+    }
+}
+
 function Test-PrivateMarkerRegexTypeText {
     param([AllowNull()][object]$Text)
 
@@ -1030,6 +1441,7 @@ $requiredFiles = @(
     'SECURITY.md',
     'SKILL.md',
     'docs/SKILL.ja.md',
+    'docs/macos-pwsh-ci-contract.md',
     'examples/inspection-one-liners.md',
     'examples/guarded-normalization.md',
     'examples/gitattributes-editorconfig-sample.md',
@@ -1060,6 +1472,13 @@ Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'tim
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'uses:\s*actions/checkout@[0-9a-f]{40}(?:\s*#\s*v5)?' -Description 'immutable checkout action revision'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)shell:\s*powershell\s+run:\s*\.\\scripts\\test-scan-private-markers\.ps1' -Description 'explicit Windows PowerShell 5.1 scanner self-test'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)validate-ubuntu:.*runs-on:\s*ubuntu-24\.04.*test-scan-private-markers\.ps1' -Description 'Ubuntu POSIX containment self-test'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'macOS 15 job uses PowerShell 7 only' -Description 'macOS PowerShell-only platform distinction'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'macOS remains unverified until' -Description 'pre-CI macOS honesty marker'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern 'Platform results are not interchangeable' -Description 'contributor platform evidence distinction'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern 'macOS 15 job uses PowerShell 7 only' -Description 'security platform containment distinction'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern '(?im)^Status:.*unverified' -Description 'macOS pre-CI evidence status'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'PosixSessionGate' -Description 'documented POSIX gate provenance'
+Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'DllImport\("libc"\)' -Description 'documented POSIX native resolver contract'
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner self-test'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'PosixSignal.*IsSuccessfulResult' -Description 'POSIX errno cleanup regression coverage'
@@ -1069,6 +1488,52 @@ Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern '\
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'regex-match-timeout' -Description 'adversarial regex no-match regression'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?ms)^## Dogfooding.*Windows PowerShell 5\.1.*UTF-8\s+BOM' -Description 'PowerShell 5.1 BOM exception in dogfooding guidance'
 
+$expectedMacOsWorkflowJob = @'
+  validate-macos:
+    name: Validate macOS PowerShell 7
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Verify macOS and PowerShell Core
+        shell: pwsh
+        run: |
+          if (-not $IsMacOS) {
+            throw 'Expected a macOS host.'
+          }
+          if ($PSVersionTable.PSEdition -cne 'Core') {
+            throw 'Expected PowerShell Core.'
+          }
+          if ($PSVersionTable.PSVersion.Major -ne 7) {
+            throw 'Expected PowerShell 7.'
+          }
+
+      - name: Validate OSS readiness
+        shell: pwsh
+        run: ./scripts/validate-oss-readiness.ps1
+
+      - name: Test private marker scan (PowerShell 7 on macOS)
+        shell: pwsh
+        run: ./scripts/test-scan-private-markers.ps1
+
+      - name: Scan for private markers
+        shell: pwsh
+        run: ./scripts/scan-private-markers.ps1
+
+      - name: Check whitespace
+        shell: pwsh
+        run: git diff-tree --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
+'@
+Assert-WorkflowJobBlockExact `
+    -RelativePath '.github/workflows/validate.yml' `
+    -JobName 'validate-macos' `
+    -ExpectedBlock $expectedMacOsWorkflowJob
+
+Assert-PosixContainmentEvidenceValidatorRegressions `
+    -ProcessRelativePath 'scripts/private-marker-process.ps1' `
+    -SelfTestRelativePath 'scripts/test-scan-private-markers.ps1'
 Assert-ScannerHasOnlyBoundedRegexOperations `
     -RelativePath 'scripts/scan-private-markers.ps1'
 Assert-ScannerRegexPolicyValidatorRegressions `
