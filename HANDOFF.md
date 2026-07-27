@@ -2,7 +2,16 @@
 
 更新日: 2026-07-27 (JST)
 
-## Current goal (Class M)
+## Current state
+
+- 最新の機能変更は [PR #5](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/5)
+  で `main` へ squash merge済み。
+- merge commit `d850136e0df4a9200ae8f85216da36f4d7508b7c` の
+  [post-main run 30240311896](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30240311896)
+  はWindows、Ubuntu 24.04、macOS 15の全job・全stepが成功。
+- open PR / issue / 必須の既知修正: このhandoff作成時点ではなし。
+
+## Latest delivered work (Class M)
 
 - 目的: private-marker scanner が所有する Git isolation root の再帰削除を、
   OS temp 直下の exact-prefix + GUID 名を持つ通常directoryだけに限定する。
@@ -35,7 +44,7 @@
   初回検査後にも同じIDと通常directory属性を再照合する。
 - Windows PowerShell 5.1で実行する日本語commented `.ps1` のUTF-8 BOMは維持する。
 
-## Baseline
+## Starting baseline
 
 - `main` は `origin/main` の `bcd1e57` と一致。
 - PowerShell 7 / 5.1 readiness、repository private-marker scan、
@@ -58,10 +67,10 @@
   P0 / P1 / P2 / P3各0でclearance。
 - review修正後のPowerShell 7 full self-testは、既存process-tree
   post-check deadlineで1回失敗後、同条件retryで成功。5.1は初回成功。
-- PR CI、merge後main CIは未確認。
+- [PR run 30240086396](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30240086396)
+  とmerge後main run `30240311896` は3 OSすべて成功。
 
 ## Next steps
 
-1. commit / PR / CI / mergeを完了する。
-2. merge後mainのfull CIを確認する。
-3. `main == origin/main`、tracked tree、branch cleanupを再確認する。
+新しいissue、PR feedback、CI failureがなければ、実ユーザー文書を変更せず、
+synthetic fixtureで証明できる次のlocal-safe Class S/M改善を選ぶ。
