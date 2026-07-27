@@ -95,6 +95,10 @@ and selected high-signal dotfiles. Unknown extensions remain outside this
 targeted text classifier. Unique staged blobs are read through one bounded
 binary-safe batch, and byte-identical final raw stage/flag enumerations are
 required after marker analysis and immediately before reporting.
+The scanner owns only an exact GUID-named direct child of the OS temporary
+directory for its Git-isolation configuration. A separate per-run owner
+marker and a second root/marker lookup immediately before recursive removal
+reject missing, leaf, reparse, nested, wrong-name, or replacement roots.
 Line length/count, per-rule match traversal, per-file/total findings, and
 diagnostic width are separately bounded. Output escapes control/format,
 bidi, and Unicode line/paragraph separator characters; matched values

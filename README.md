@@ -317,6 +317,13 @@ configuration, and inert hook/attribute/exclude/template settings.
 Its per-command deadline defaults to 15 seconds and cannot be raised
 above that value; the self-test lowers it only for the synthetic hang
 fixture.
+The scanner-owned Git isolation root is limited to an exact
+`windows-utf8-text-hygiene-git-<32 lowercase hex>` direct child of the OS
+temporary directory. A separate per-run owner marker is checked as an
+ownership claim.
+Cleanup reacquires both the regular, non-reparse root and that marker
+immediately before recursive removal, so a regular-directory or reparse
+replacement between the first check and deletion fails closed.
 On Windows, the requested executable is created suspended with only its
 three standard-I/O handles inheritable, assigned to a kill-on-close Job,
 and resumed only after assignment. An immediately spawning command

@@ -892,7 +892,11 @@ if ($null -eq $gitExe) {
     $gitIsolationRoot = Join-Path (
         [System.IO.Path]::GetTempPath()
     ) ("windows-utf8-text-hygiene-git-" + [System.Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $gitIsolationRoot | Out-Null
+    $gitIsolationOwnerId = [System.Guid]::NewGuid().ToString('N')
+    New-PrivateMarkerGitIsolationRoot `
+        -Root $gitIsolationRoot `
+        -TemporaryParent ([System.IO.Path]::GetTempPath()) `
+        -OwnerId $gitIsolationOwnerId
     $gitPreparationRegexTimedOut = $false
     try {
         $rootProbe = Invoke-ScannerGit `
@@ -1351,15 +1355,19 @@ if ($null -eq $gitExe) {
         $changedEnvironmentNames = @(
             Get-ChangedEnvironmentVariableNames -Expected $environmentBeforeGit
         )
-        if (-not $verifyGitIndexAtScanEnd -and
-            (Test-Path -LiteralPath $gitIsolationRoot)) {
-            Remove-Item -LiteralPath $gitIsolationRoot -Recurse -Force
+        if (-not $verifyGitIndexAtScanEnd) {
+            Remove-PrivateMarkerGitIsolationRoot `
+                -Root $gitIsolationRoot `
+                -TemporaryParent ([System.IO.Path]::GetTempPath()) `
+                -OwnerId $gitIsolationOwnerId
         }
     }
     if ($changedEnvironmentNames.Count -gt 0) {
-        if ($verifyGitIndexAtScanEnd -and
-            (Test-Path -LiteralPath $gitIsolationRoot)) {
-            Remove-Item -LiteralPath $gitIsolationRoot -Recurse -Force
+        if ($verifyGitIndexAtScanEnd) {
+            Remove-PrivateMarkerGitIsolationRoot `
+                -Root $gitIsolationRoot `
+                -TemporaryParent ([System.IO.Path]::GetTempPath()) `
+                -OwnerId $gitIsolationOwnerId
         }
         throw "Hermetic Git boundary changed scanner environment variables: $($changedEnvironmentNames -join ', ')."
     }
@@ -1476,9 +1484,10 @@ finally {
         $finalGitEnvironmentChanges = @(
             Get-ChangedEnvironmentVariableNames -Expected $environmentBeforeGit
         )
-        if (Test-Path -LiteralPath $gitIsolationRoot) {
-            Remove-Item -LiteralPath $gitIsolationRoot -Recurse -Force
-        }
+        Remove-PrivateMarkerGitIsolationRoot `
+            -Root $gitIsolationRoot `
+            -TemporaryParent ([System.IO.Path]::GetTempPath()) `
+            -OwnerId $gitIsolationOwnerId
     }
 }
 if ($finalGitEnvironmentChanges.Count -gt 0) {
