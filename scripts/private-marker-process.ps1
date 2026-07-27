@@ -739,6 +739,188 @@ function Test-PrivateMarkerWindowsHost {
     }
 }
 
+function Test-PrivateMarkerGitIsolationRootBoundary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TemporaryParent
+    )
+
+    try {
+        # 再帰削除候補はOS temp直下の専用prefix + GUID名だけに限定する。
+        # lexical pathを先に固定し、temp root自身やnested pathを所有物と誤認しない。
+        $separators = [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        $resolvedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd($separators)
+        $resolvedTemporaryParent =
+            [System.IO.Path]::GetFullPath($TemporaryParent).TrimEnd($separators)
+        $resolvedRootParent =
+            [System.IO.Path]::GetDirectoryName($resolvedRoot)
+        if ([string]::IsNullOrWhiteSpace($resolvedRoot) -or
+            [string]::IsNullOrWhiteSpace($resolvedTemporaryParent) -or
+            [string]::IsNullOrWhiteSpace($resolvedRootParent)) {
+            return $false
+        }
+        $resolvedRootParent = $resolvedRootParent.TrimEnd($separators)
+        $rootName = [System.IO.Path]::GetFileName($resolvedRoot)
+    }
+    catch {
+        return $false
+    }
+
+    $comparison = if (Test-PrivateMarkerWindowsHost) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparison]::Ordinal
+    }
+    return (
+        -not $resolvedRoot.Equals($resolvedTemporaryParent, $comparison) -and
+        $resolvedRootParent.Equals($resolvedTemporaryParent, $comparison) -and
+        $rootName -cmatch '^windows-utf8-text-hygiene-git-[0-9a-f]{32}$'
+    )
+}
+
+function New-PrivateMarkerGitIsolationRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TemporaryParent,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OwnerId
+    )
+
+    if (-not (Test-PrivateMarkerGitIsolationRootBoundary `
+            -Root $Root `
+            -TemporaryParent $TemporaryParent) -or
+        $OwnerId -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'Refusing to create a Git isolation root outside the owned temporary boundary.'
+    }
+
+    try {
+        # path名とは別のrun固有IDをroot内にも固定し、regular directoryへの
+        # check/use間差替えを最終cleanup直前に検出できるようにする。
+        New-Item `
+            -ItemType Directory `
+            -Path $Root `
+            -ErrorAction Stop |
+            Out-Null
+        $ownerPath = Join-Path $Root '.windows-utf8-text-hygiene-owner'
+        [System.IO.File]::WriteAllText(
+            $ownerPath,
+            $OwnerId,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+    catch {
+        throw 'Git isolation root could not be initialized safely.'
+    }
+}
+
+function Assert-PrivateMarkerGitIsolationRootState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OwnerId
+    )
+
+    try {
+        $rootItem = Get-Item `
+            -LiteralPath ([System.IO.Path]::GetFullPath($Root)) `
+            -Force `
+            -ErrorAction Stop
+    }
+    catch {
+        throw 'Git isolation root could not be inspected safely before cleanup.'
+    }
+    if (-not $rootItem.PSIsContainer -or
+        ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Refusing to recursively remove a Git isolation root through a leaf or reparse point.'
+    }
+
+    try {
+        $ownerPath = Join-Path $rootItem.FullName '.windows-utf8-text-hygiene-owner'
+        $ownerItem = Get-Item `
+            -LiteralPath $ownerPath `
+            -Force `
+            -ErrorAction Stop
+        if ($ownerItem.PSIsContainer -or
+            ($ownerItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $ownerItem.Length -ne 32) {
+            throw 'invalid-owner-marker'
+        }
+        $ownerBytes = [System.IO.File]::ReadAllBytes($ownerItem.FullName)
+        if ($ownerBytes.Length -ne 32) {
+            throw 'invalid-owner-marker'
+        }
+        $actualOwnerId =
+            [System.Text.Encoding]::ASCII.GetString($ownerBytes)
+        if ($actualOwnerId -cne $OwnerId -or
+            $actualOwnerId -cnotmatch '^[0-9a-f]{32}$') {
+            throw 'invalid-owner-marker'
+        }
+    }
+    catch {
+        throw 'Git isolation root ownership changed before cleanup.'
+    }
+}
+
+function Remove-PrivateMarkerGitIsolationRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TemporaryParent,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OwnerId,
+
+        # self-testだけが最初のsnapshot後へ差替えを注入し、実際の
+        # check/use interleavingをdeterministicに再現する。
+        [Parameter(DontShow = $true)]
+        [scriptblock]$BeforeFinalValidation = $null
+    )
+
+    if (-not (Test-PrivateMarkerGitIsolationRootBoundary `
+            -Root $Root `
+            -TemporaryParent $TemporaryParent) -or
+        $OwnerId -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'Refusing to remove a Git isolation root outside the owned temporary boundary.'
+    }
+
+    Assert-PrivateMarkerGitIsolationRootState `
+        -Root $Root `
+        -OwnerId $OwnerId
+    if ($null -ne $BeforeFinalValidation) {
+        & $BeforeFinalValidation
+    }
+
+    # raw recursive deleteの直前にpathを再取得し、root属性とrun固有markerを
+    # もう一度照合する。snapshot後のmissing/leaf/reparse/別directory化を拒否する。
+    Assert-PrivateMarkerGitIsolationRootState `
+        -Root $Root `
+        -OwnerId $OwnerId
+    try {
+        Remove-Item `
+            -LiteralPath ([System.IO.Path]::GetFullPath($Root)) `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop
+    }
+    catch {
+        throw 'Git isolation root cleanup failed inside the owned temporary boundary.'
+    }
+}
+
 function ConvertTo-PrivateMarkerPosixGateFailureReason {
     param([AllowEmptyString()][string]$Status)
 

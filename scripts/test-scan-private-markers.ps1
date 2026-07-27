@@ -274,6 +274,204 @@ $preexistingScannerIsolationRoots = @(
 )
 
 try {
+    # scanner自身のrecursive cleanupは、OS temp直下の専用GUID directoryだけを
+    # 所有物として扱う。広いtemp root、wrong-name、nested pathは削除候補にしない。
+    $cleanupTemporaryParent = [System.IO.Path]::GetTempPath()
+    $validCleanupRoot = Join-Path `
+        $cleanupTemporaryParent `
+        ("windows-utf8-text-hygiene-git-" + [Guid]::NewGuid().ToString('N'))
+    $wrongNameCleanupRoot = Join-Path `
+        $cleanupTemporaryParent `
+        'windows-utf8-text-hygiene-git-not-a-guid'
+    $nestedCleanupRoot = Join-Path `
+        $tempRoot `
+        ("windows-utf8-text-hygiene-git-" + [Guid]::NewGuid().ToString('N'))
+    if (-not (Test-PrivateMarkerGitIsolationRootBoundary `
+            -Root $validCleanupRoot `
+            -TemporaryParent $cleanupTemporaryParent)) {
+        Add-Failure 'Expected the direct GUID-named Git isolation root to satisfy the cleanup boundary.'
+    }
+    if (Test-PrivateMarkerGitIsolationRootBoundary `
+            -Root $cleanupTemporaryParent `
+            -TemporaryParent $cleanupTemporaryParent) {
+        Add-Failure 'Expected the OS temporary root itself to fail the Git isolation cleanup boundary.'
+    }
+    if (Test-PrivateMarkerGitIsolationRootBoundary `
+            -Root $wrongNameCleanupRoot `
+            -TemporaryParent $cleanupTemporaryParent) {
+        Add-Failure 'Expected a wrong-name Git isolation root to fail the cleanup boundary.'
+    }
+    if (Test-PrivateMarkerGitIsolationRootBoundary `
+            -Root $nestedCleanupRoot `
+            -TemporaryParent $cleanupTemporaryParent) {
+        Add-Failure 'Expected a nested Git isolation root to fail the direct-child cleanup boundary.'
+    }
+
+    $validCleanupOwnerId = [Guid]::NewGuid().ToString('N')
+    New-PrivateMarkerGitIsolationRoot `
+        -Root $validCleanupRoot `
+        -TemporaryParent $cleanupTemporaryParent `
+        -OwnerId $validCleanupOwnerId
+    Set-Content `
+        -LiteralPath (Join-Path $validCleanupRoot 'owned.txt') `
+        -Value 'synthetic owned cleanup fixture' `
+        -Encoding UTF8
+    Remove-PrivateMarkerGitIsolationRoot `
+        -Root $validCleanupRoot `
+        -TemporaryParent $cleanupTemporaryParent `
+        -OwnerId $validCleanupOwnerId
+    if (Test-Path -LiteralPath $validCleanupRoot) {
+        Add-Failure 'Expected the valid owned Git isolation root to be removed.'
+    }
+
+    # 最初のsnapshot後にroot自体が消えた場合は、別pathへ探索を広げず
+    # 固定診断でfail closedし、無関係なexternal sentinelを保持する。
+    $missingCleanupRoot = Join-Path `
+        $cleanupTemporaryParent `
+        ("windows-utf8-text-hygiene-git-" + [Guid]::NewGuid().ToString('N'))
+    $missingCleanupOwnerId = [Guid]::NewGuid().ToString('N')
+    $missingCleanupTarget = Join-Path $tempRoot 'missing root external target'
+    $missingCleanupSentinel = Join-Path $missingCleanupTarget 'preserve.txt'
+    New-Item -ItemType Directory -Path $missingCleanupTarget | Out-Null
+    Set-Content `
+        -LiteralPath $missingCleanupSentinel `
+        -Value 'synthetic external target' `
+        -Encoding UTF8
+    New-PrivateMarkerGitIsolationRoot `
+        -Root $missingCleanupRoot `
+        -TemporaryParent $cleanupTemporaryParent `
+        -OwnerId $missingCleanupOwnerId
+    $missingOwnerMarker = Join-Path `
+        $missingCleanupRoot `
+        '.windows-utf8-text-hygiene-owner'
+    $removeBeforeFinalValidation = {
+        [System.IO.File]::Delete($missingOwnerMarker)
+        [System.IO.Directory]::Delete($missingCleanupRoot)
+    }.GetNewClosure()
+    $missingRootRejected = $false
+    try {
+        Remove-PrivateMarkerGitIsolationRoot `
+            -Root $missingCleanupRoot `
+            -TemporaryParent $cleanupTemporaryParent `
+            -OwnerId $missingCleanupOwnerId `
+            -BeforeFinalValidation $removeBeforeFinalValidation
+    }
+    catch {
+        $missingRootRejected = $_.Exception.Message -ceq
+            'Git isolation root could not be inspected safely before cleanup.'
+    }
+    if (-not $missingRootRejected) {
+        Add-Failure 'Expected a missing-root Git isolation root to fail with the fixed inspection diagnostic.'
+    }
+    if (-not (Test-Path -LiteralPath $missingCleanupSentinel -PathType Leaf)) {
+        Add-Failure 'Expected rejected missing-root cleanup to preserve the external synthetic target.'
+    }
+    if (Test-Path -LiteralPath $missingCleanupRoot) {
+        [System.IO.File]::Delete($missingOwnerMarker)
+        [System.IO.Directory]::Delete($missingCleanupRoot)
+    }
+
+    # 最初のsnapshot後に別のregular directoryへ置換し、owner markerの
+    # 再照合がraw recursive deleteより先に拒否することを固定する。
+    $directoryReplacementRoot = Join-Path `
+        $cleanupTemporaryParent `
+        ("windows-utf8-text-hygiene-git-" + [Guid]::NewGuid().ToString('N'))
+    $directoryReplacementOwnerId = [Guid]::NewGuid().ToString('N')
+    New-PrivateMarkerGitIsolationRoot `
+        -Root $directoryReplacementRoot `
+        -TemporaryParent $cleanupTemporaryParent `
+        -OwnerId $directoryReplacementOwnerId
+    $directoryOwnerMarker = Join-Path `
+        $directoryReplacementRoot `
+        '.windows-utf8-text-hygiene-owner'
+    $replaceWithDirectory = {
+        [System.IO.File]::Delete($directoryOwnerMarker)
+        [System.IO.Directory]::Delete($directoryReplacementRoot)
+        [void][System.IO.Directory]::CreateDirectory($directoryReplacementRoot)
+    }.GetNewClosure()
+    try {
+        $directoryReplacementRejected = $false
+        try {
+            Remove-PrivateMarkerGitIsolationRoot `
+                -Root $directoryReplacementRoot `
+                -TemporaryParent $cleanupTemporaryParent `
+                -OwnerId $directoryReplacementOwnerId `
+                -BeforeFinalValidation $replaceWithDirectory
+        }
+        catch {
+            $directoryReplacementRejected =
+                $_.Exception.Message -match 'ownership changed'
+        }
+        if (-not $directoryReplacementRejected) {
+            Add-Failure 'Expected a check/use regular-directory replacement to fail owner validation.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $directoryReplacementRoot) {
+            [System.IO.Directory]::Delete($directoryReplacementRoot)
+        }
+    }
+
+    # 最初のsnapshot後にroot自体をjunction/symlinkへ置換した場合も、
+    # 最終属性照合で再帰削除せず、external targetを保持する。
+    $reparseCleanupRoot = Join-Path `
+        $cleanupTemporaryParent `
+        ("windows-utf8-text-hygiene-git-" + [Guid]::NewGuid().ToString('N'))
+    $reparseCleanupOwnerId = [Guid]::NewGuid().ToString('N')
+    $reparseCleanupTarget = Join-Path $tempRoot 'git isolation external target'
+    $reparseCleanupSentinel = Join-Path $reparseCleanupTarget 'preserve.txt'
+    New-Item -ItemType Directory -Path $reparseCleanupTarget | Out-Null
+    Set-Content `
+        -LiteralPath $reparseCleanupSentinel `
+        -Value 'synthetic external target' `
+        -Encoding UTF8
+    New-PrivateMarkerGitIsolationRoot `
+        -Root $reparseCleanupRoot `
+        -TemporaryParent $cleanupTemporaryParent `
+        -OwnerId $reparseCleanupOwnerId
+    $reparseOwnerMarker = Join-Path `
+        $reparseCleanupRoot `
+        '.windows-utf8-text-hygiene-owner'
+    try {
+        $reparseType = if (Test-PrivateMarkerWindowsHost) {
+            'Junction'
+        } else {
+            'SymbolicLink'
+        }
+        $replaceWithReparse = {
+            [System.IO.File]::Delete($reparseOwnerMarker)
+            [System.IO.Directory]::Delete($reparseCleanupRoot)
+            New-Item `
+                -ItemType $reparseType `
+                -Path $reparseCleanupRoot `
+                -Target $reparseCleanupTarget |
+                Out-Null
+        }.GetNewClosure()
+        $reparseRejected = $false
+        try {
+            Remove-PrivateMarkerGitIsolationRoot `
+                -Root $reparseCleanupRoot `
+                -TemporaryParent $cleanupTemporaryParent `
+                -OwnerId $reparseCleanupOwnerId `
+                -BeforeFinalValidation $replaceWithReparse
+        }
+        catch {
+            $reparseRejected =
+                $_.Exception.Message -match 'leaf or reparse point'
+        }
+        if (-not $reparseRejected) {
+            Add-Failure 'Expected a reparse-point Git isolation root to fail closed before recursive cleanup.'
+        }
+        if (-not (Test-Path -LiteralPath $reparseCleanupSentinel -PathType Leaf)) {
+            Add-Failure 'Expected rejected Git isolation cleanup to preserve the external synthetic target.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $reparseCleanupRoot) {
+            [System.IO.Directory]::Delete($reparseCleanupRoot)
+        }
+    }
+
     # Prefix・UTF-8 multibyte・実platform改行をすべて含めたraw byte数で、
     # exact limitは成功し、1 byte超過だけがbounded failureになることを確認する。
     $boundaryEmitterPath = Join-Path $tempRoot 'RawBoundaryEmitter.ps1'

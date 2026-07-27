@@ -56,6 +56,30 @@ function Assert-FileContains {
     }
 }
 
+function Assert-FilePatternCount {
+    param(
+        [string]$RelativePath,
+        [string]$Pattern,
+        [int]$ExpectedCount,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $filePath -Raw
+    $actualCount = [regex]::Matches($content, $Pattern).Count
+    if ($actualCount -ne $ExpectedCount) {
+        Add-Failure (
+            "$RelativePath must contain exactly $ExpectedCount $Description " +
+            "(actual: $actualCount)."
+        )
+    }
+}
+
 function Assert-FileDoesNotContain {
     param(
         [string]$RelativePath,
@@ -1400,9 +1424,10 @@ function Test-ScannerHasOnlyBoundedRegexOperationsSource {
         'New-Item',
         'New-Object',
         'New-PrivateMarkerBoundedRegex',
+        'New-PrivateMarkerGitIsolationRoot',
         'Out-Null',
         'Read-StableWorktreeBytes',
-        'Remove-Item',
+        'Remove-PrivateMarkerGitIsolationRoot',
         'Resolve-Path',
         'Select-Object',
         'Set-StrictMode',
@@ -1938,6 +1963,11 @@ function Assert-ScannerRegexPolicyValidatorRegressions {
                 '[ScriptBlock]::Create(''param()'')'
         },
         [pscustomobject]@{
+            Name = 'raw recursive Git isolation-root removal'
+            Source = $source + $newline +
+                'Remove-Item -Recurse -Force -LiteralPath $gitIsolationRoot'
+        },
+        [pscustomobject]@{
             Name = 'unknown command surface'
             Source = $source + $newline + 'Write-Output ''x'''
         }
@@ -2023,6 +2053,7 @@ $requiredFiles = @(
     'CHANGELOG.md',
     'CODE_OF_CONDUCT.md',
     'CONTRIBUTING.md',
+    'HANDOFF.md',
     'LICENSE',
     'README.md',
     'SECURITY.md',
@@ -2052,6 +2083,9 @@ Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Des
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'per-run owner marker' -Description 'documented Git isolation-root ownership contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern 'second root/marker lookup' -Description 'security cleanup check/use contract'
+Assert-FileContains -RelativePath 'CHANGELOG.md' -Pattern 'deterministic regular-directory' -Description 'cleanup replacement regression changelog'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'validate-oss-readiness\.ps1' -Description 'OSS readiness validation in CI'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'scan-private-markers\.ps1' -Description 'private marker scan in CI'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'test-scan-private-markers\.ps1' -Description 'private marker scan self-test in CI'
@@ -2083,6 +2117,30 @@ Assert-FileContains -RelativePath 'docs/macos-pwsh-ci-contract.md' -Pattern 'Dll
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'private-marker-process\.ps1' -Description 'shared bounded process boundary in scanner self-test'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'PosixSignal.*IsSuccessfulResult' -Description 'POSIX errno cleanup regression coverage'
+Assert-FileContains -RelativePath 'scripts/private-marker-process.ps1' -Pattern 'function\s+Test-PrivateMarkerGitIsolationRootBoundary' -Description 'owned Git isolation-root boundary'
+Assert-FileContains -RelativePath 'scripts/private-marker-process.ps1' -Pattern 'function\s+New-PrivateMarkerGitIsolationRoot' -Description 'owned Git isolation-root initializer'
+Assert-FileContains -RelativePath 'scripts/private-marker-process.ps1' -Pattern '\^windows-utf8-text-hygiene-git-\[0-9a-f\]\{32\}\$' -Description 'exact Git isolation-root prefix and GUID contract'
+Assert-FileContains -RelativePath 'scripts/private-marker-process.ps1' -Pattern 'FileAttributes\]::ReparsePoint' -Description 'Git isolation-root reparse-point rejection'
+Assert-FileContains -RelativePath 'scripts/private-marker-process.ps1' -Pattern '\.windows-utf8-text-hygiene-owner' -Description 'Git isolation-root owner marker'
+Assert-FilePatternCount `
+    -RelativePath 'scripts/private-marker-process.ps1' `
+    -Pattern '(?m)^\s*Assert-PrivateMarkerGitIsolationRootState\b' `
+    -ExpectedCount 2 `
+    -Description 'pre-cleanup Git isolation-root state validations'
+Assert-FilePatternCount `
+    -RelativePath 'scripts/scan-private-markers.ps1' `
+    -Pattern '(?m)^\s*Remove-PrivateMarkerGitIsolationRoot\b' `
+    -ExpectedCount 3 `
+    -Description 'guarded Git isolation-root cleanup callsites'
+Assert-FileDoesNotContain `
+    -RelativePath 'scripts/scan-private-markers.ps1' `
+    -Pattern '(?m)^\s*Remove-Item\s+-LiteralPath\s+\$gitIsolationRoot\s+-Recurse\s+-Force\s*$' `
+    -Description 'raw recursive Git isolation-root cleanup'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'wrong-name Git isolation root' -Description 'wrong-name Git isolation-root cleanup rejection'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'missing-root Git isolation root' -Description 'missing-root Git isolation-root cleanup rejection'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'reparse-point Git isolation root' -Description 'reparse-point Git isolation-root cleanup rejection'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'BeforeFinalValidation' -Description 'deterministic Git isolation-root check/use interleaving seam'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern 'regular-directory replacement' -Description 'regular-directory ownership replacement regression'
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern 'New-PrivateMarkerBoundedRegex' -Description 'finite regex match-timeout constructor'
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern 'RegexMatchTimeoutException' -Description 'regex timeout fail-closed handling'
 Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern '\$maximumRegexMatchMilliseconds\s*=\s*250' -Description 'bounded regex match duration'

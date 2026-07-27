@@ -56,6 +56,11 @@ The format loosely follows Keep a Changelog conventions.
   adversarial one-million-character no-match regression, a near-limit safe
   positive control, and an AST mutation gate covering alternate construction
   paths and timeout provenance.
+- Limited recursive cleanup of scanner-owned Git isolation roots to an exact
+  OS-temporary direct child with the repository prefix, a 32-hex GUID name,
+  and a separate per-run owner marker. Cleanup reacquires root attributes and
+  marker ownership immediately before deletion; deterministic regular-directory
+  and reparse replacements now fail closed without removing external content.
 - Added adversarial success/failure fixtures that preserve the parent
   environment (including present-empty values), verify target-repository
   enumeration, staged/worktree union, real staged add/replace drift,
