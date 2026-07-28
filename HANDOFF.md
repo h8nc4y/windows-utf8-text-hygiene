@@ -2,7 +2,7 @@
 
 更新日: 2026-07-28 (JST)
 
-## Current goal (Class M)
+## Latest delivered work (Class M)
 
 - 目的: `git status --porcelain=v1 -z` が0件・1件・複数件のどの場合も、
   guarded-normalization例がrecord列を同じ配列型として扱えるようにする。
@@ -11,7 +11,7 @@
 - RED: 1 recordだけを現行parserへ渡すと、pipeline出力が`System.String`へ
   scalar化され、`$entries[0]`が`System.Char`となって`Substring()`に失敗する。
 
-## Current success metrics
+## Delivered success metrics
 
 - NUL区切りsynthetic inputで0 / 1 / multiple cardinalityをPS7 / PS5.1で通す。
 - 日本語名・空白名を保持し、rename pairとdeleteを従来どおりskipする。
@@ -29,21 +29,26 @@
 - readiness / repo scanはPS7・PS5.1・Ubuntu 24.04でpass。Ubuntu scanは
   Windows worktreeのgitdirがcontainer内で無効なため、read-only sourceを
   container内の一時git indexへ登録して実測した。
-- PS7 full scanner suiteはexit 0（`Private marker scan self-test passed.`）。
-  PS5.1 full suiteはmachine-wide排他slot待ち、3 OS CIはPR後のため未確認。
+- PS7 / PS5.1 full scanner suiteはexit 0
+  （`Private marker scan self-test passed.`）、stderr 0 bytes。
 - Gitleaks dir / 直近4 commitsは0件、Semgrep `p/security-audit`は
   24 files / 0 findings。tracked 24 filesのUTF-8 / BOM / LF hygieneも全項目0。
+- exact freezeの独立reviewはP0 / P1 / P2 / P3各0、CLEARANCE YES。
+- [PR #7](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/7)と
+  merge後のmainで、Windows / Ubuntu 24.04 / macOS 15の全jobが成功。
 
 ## Current state
 
-- 最新の機能変更は [PR #5](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/5)
-  で `main` へ squash merge済み。
-- merge commit `d850136e0df4a9200ae8f85216da36f4d7508b7c` の
-  [post-main run 30240311896](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30240311896)
-  はWindows、Ubuntu 24.04、macOS 15の全job・全stepが成功。
-- open PR / issue / 必須の既知修正: このhandoff作成時点ではなし。
-- 2026-07-28のlive確認では`main == origin/main == a84f725`、open PR / issue
-  は0件、main run `30240973453`は3 OS success。
+- 最新の機能変更はPR #7で`main`へsquash merge済み。merge commitは
+  `245b9e554753d84c884390b6aef279104b2799c1`。
+- [PR run 30340730616](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30340730616)
+  と
+  [post-main run 30341194328](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30341194328)
+  はWindows、Ubuntu 24.04、macOS 15の全jobが成功。
+- `origin/main` treeはレビュー済みtree
+  `386be10b892d4d580a84b97bbb19753590b1189c`と一致。
+- open PR / issue / 必須の既知修正は0件。implementation task branchと
+  隔離worktreeはcleanup済み。
 
 ## Previous delivered work (Class M)
 
@@ -73,7 +78,7 @@
 
 ## Recent decisions
 
-- 実ユーザー文書は変更せず、synthetic fixtureと明示UTF-8だけを使う。
+- 利用者の実ファイルは変更せず、synthetic fixtureと明示UTF-8だけを使う。
 - path名だけではownership証明にしない。別の32桁IDをroot内へ保存し、
   初回検査後にも同じIDと通常directory属性を再照合する。
 - Windows PowerShell 5.1で実行する日本語commented `.ps1` のUTF-8 BOMは維持する。
@@ -106,6 +111,5 @@
 
 ## Next steps
 
-1. 排他slotでPS5.1 full scanner suiteを完走する。
-2. exact freezeの独立review後、PR / 3 OS CI、mergeを完了する。
-3. post-mainを再実測し、worktreeとbranchをcleanupする。
+新しいissue、PR feedback、CI failureがなければ、利用者の実ファイルを変更せず、
+synthetic fixtureで証明できる次のlocal-safe Class S/M改善を選ぶ。
