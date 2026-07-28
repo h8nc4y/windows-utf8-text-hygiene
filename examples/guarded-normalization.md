@@ -45,7 +45,9 @@ $repo = '<repo>'
 # spaces arrive double-quoted — both silently fail an extension filter
 # (measured). -z is immune to both.
 $raw = (git -C $repo status --porcelain=v1 -z) -join ''
-$entries = $raw -split "`0" | Where-Object { $_ }
+[string[]]$entries = @(
+    $raw -split "`0" | Where-Object { $_ }
+)
 $files = @()
 for ($i = 0; $i -lt $entries.Count; $i++) {
     $status = $entries[$i].Substring(0, 2)

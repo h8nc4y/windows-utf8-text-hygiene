@@ -8,6 +8,12 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Kept the guarded-normalization porcelain parser array-stable for zero,
+  one, or multiple NUL-delimited records. Synthetic PowerShell 7 and
+  Windows PowerShell 5.1 readiness fixtures preserve Japanese and
+  space-bearing paths while continuing to skip rename pairs and deletions;
+  source mutations reject scalar assignments, relocated decoys, duplicate
+  blocks, and weakened skip logic.
 - Added a bounded `macos-15` PowerShell 7 CI contract for the native POSIX
   session fallback. Run
   [30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010)

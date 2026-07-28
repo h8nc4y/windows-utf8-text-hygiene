@@ -417,6 +417,345 @@ function Get-OrdinalFragmentCount {
     return $count
 }
 
+function Get-GuardedNormalizationExpectedEnumerationBlock {
+    # 公開exampleとvalidatorが同じcopy-adaptable blockを正本として共有できるよう、
+    # scalar化を防ぐ型宣言を含む最小の列挙phaseをexact textで固定する。
+    return @'
+$raw = (git -C $repo status --porcelain=v1 -z) -join ''
+[string[]]$entries = @(
+    $raw -split "`0" | Where-Object { $_ }
+)
+$files = @()
+for ($i = 0; $i -lt $entries.Count; $i++) {
+    $status = $entries[$i].Substring(0, 2)
+    $path = $entries[$i].Substring(3)
+    if ($status -match 'R') { $i++; continue }   # rename: skip entry + its old-path token
+    if ($status -match 'D') { continue }         # deleted: nothing left to normalize
+    $files += Join-Path $repo $path
+}
+$files = $files | Where-Object { $_ -match '\.(md|txt|yml|yaml|json|py|js|ts)$' }
+'@
+}
+
+function Get-GuardedNormalizationCandidatePaths {
+    param(
+        [string]$RepoPath,
+        [AllowEmptyString()]
+        [string]$Raw
+    )
+
+    # NUL splitが0件・1件でも必ずstring arrayを作る。PowerShell pipelineは
+    # 1件だけをscalarへ展開するため、@(...)を外すとindexがcharを返してしまう。
+    [string[]]$entries = @(
+        $Raw -split "`0" | Where-Object { $_ }
+    )
+    $files = @()
+    for ($index = 0; $index -lt $entries.Count; $index++) {
+        $status = $entries[$index].Substring(0, 2)
+        $path = $entries[$index].Substring(3)
+
+        # porcelain -zのrenameは新path recordの直後に旧path tokenが続く。
+        # 両方を正規化対象から外し、旧pathをstatus recordとして再解釈しない。
+        if ($status -match 'R') {
+            $index++
+            continue
+        }
+        if ($status -match 'D') {
+            continue
+        }
+        $files += Join-Path $RepoPath $path
+    }
+
+    return @(
+        $files |
+            Where-Object {
+                $_ -match '\.(md|txt|yml|yaml|json|py|js|ts)$'
+            }
+    )
+}
+
+function Test-StringSequenceExact {
+    param(
+        [object[]]$Actual,
+        [object[]]$Expected
+    )
+
+    $actualValues = @($Actual)
+    $expectedValues = @($Expected)
+    if ($actualValues.Count -ne $expectedValues.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedValues.Count; $index++) {
+        if (-not [string]::Equals(
+                [string]$actualValues[$index],
+                [string]$expectedValues[$index],
+                [System.StringComparison]::Ordinal
+            )) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-GuardedNormalizationPorcelainSemantics {
+    param([scriptblock]$Parser)
+
+    $syntheticRepo = 'synthetic-root'
+    $japaneseName = '日本語 file.md'
+    $spaceName = 'space name.txt'
+    $keepName = 'keep.json'
+    $fixtures = @(
+        [pscustomobject]@{
+            Name = 'zero records'
+            Raw = ''
+            Expected = @()
+        },
+        [pscustomobject]@{
+            Name = 'one Japanese and space-bearing record'
+            Raw = " M $japaneseName`0"
+            Expected = @(
+                Join-Path $syntheticRepo $japaneseName
+            )
+        },
+        [pscustomobject]@{
+            Name = 'multiple records'
+            Raw = " M $japaneseName`0A  $spaceName`0"
+            Expected = @(
+                Join-Path $syntheticRepo $japaneseName
+                Join-Path $syntheticRepo $spaceName
+            )
+        },
+        [pscustomobject]@{
+            Name = 'rename pair and deletion'
+            Raw = "R  renamed.md`0old.md`0 D deleted.txt`0"
+            Expected = @()
+        },
+        [pscustomobject]@{
+            Name = 'kept record around skipped records'
+            Raw = "R  renamed.md`0old.md`0 M $keepName`0 D deleted.txt`0"
+            Expected = @(
+                Join-Path $syntheticRepo $keepName
+            )
+        }
+    )
+
+    foreach ($fixture in $fixtures) {
+        try {
+            $actual = @(
+                & $Parser $syntheticRepo ([string]$fixture.Raw)
+            )
+        }
+        catch {
+            return $false
+        }
+        if (-not (Test-StringSequenceExact `
+                -Actual $actual `
+                -Expected @($fixture.Expected))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-GuardedNormalizationExampleContract {
+    param([string]$Source)
+
+    if ([string]::IsNullOrWhiteSpace($Source)) {
+        return $false
+    }
+    $normalizedSource = $Source.Replace("`r`n", "`n")
+    $sectionMarker = '## The pattern' + "`n"
+    $sectionStart = $normalizedSource.IndexOf(
+        $sectionMarker,
+        [System.StringComparison]::Ordinal
+    )
+    if ($sectionStart -lt 0) {
+        return $false
+    }
+    $sectionEnd = $normalizedSource.IndexOf(
+        "`n## ",
+        $sectionStart + $sectionMarker.Length,
+        [System.StringComparison]::Ordinal
+    )
+    if ($sectionEnd -lt 0) {
+        return $false
+    }
+    $section = $normalizedSource.Substring(
+        $sectionStart,
+        $sectionEnd - $sectionStart
+    )
+
+    # exact blockをThe pattern内の唯一のPowerShell fenceへ閉じ込める。
+    # 別sectionへ正しいdecoyを置き、実行例だけ弱める形も拒否する。
+    $fenceMarker = '```powershell' + "`n"
+    if ((Get-OrdinalFragmentCount `
+            -Content $section `
+            -Fragment $fenceMarker) -ne 1) {
+        return $false
+    }
+    $fenceStart = $section.IndexOf(
+        $fenceMarker,
+        [System.StringComparison]::Ordinal
+    )
+    $codeStart = $fenceStart + $fenceMarker.Length
+    $fenceEnd = $section.IndexOf(
+        "`n" + '```',
+        $codeStart,
+        [System.StringComparison]::Ordinal
+    )
+    if ($fenceStart -lt 0 -or $fenceEnd -lt 0) {
+        return $false
+    }
+    $fencedCode = $section.Substring(
+        $codeStart,
+        $fenceEnd - $codeStart
+    )
+    $expectedBlock = Get-GuardedNormalizationExpectedEnumerationBlock
+    if ((Get-OrdinalFragmentCount `
+            -Content $normalizedSource `
+            -Fragment $expectedBlock) -ne 1 -or
+        (Get-OrdinalFragmentCount `
+            -Content $fencedCode `
+            -Fragment $expectedBlock) -ne 1 -or
+        (Get-OrdinalFragmentCount `
+            -Content $fencedCode `
+            -Fragment '$raw = (git -C $repo status --porcelain=v1 -z)') -ne 1 -or
+        (Get-OrdinalFragmentCount `
+            -Content $fencedCode `
+            -Fragment '$entries =') -ne 1) {
+        return $false
+    }
+    return $true
+}
+
+function Assert-GuardedNormalizationExampleValidatorRegressions {
+    param([string]$RelativePath)
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath (guarded-normalization contract)"
+        return
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $source = [System.IO.File]::ReadAllText($filePath, $strictUtf8)
+    }
+    catch {
+        Add-Failure "$RelativePath must be strict UTF-8."
+        return
+    }
+
+    if (-not (Test-GuardedNormalizationExampleContract -Source $source)) {
+        Add-Failure "$RelativePath must keep the exact array-safe porcelain enumeration block."
+        return
+    }
+
+    # 意味fixtureはfilesystemへ触れず、synthetic NUL recordsだけで
+    # cardinality・Unicode path・rename/delete skipを同時に固定する。
+    $canonicalParser = {
+        param($RepoPath, $Raw)
+        Get-GuardedNormalizationCandidatePaths `
+            -RepoPath $RepoPath `
+            -Raw $Raw
+    }
+    if (-not (Test-GuardedNormalizationPorcelainSemantics `
+            -Parser $canonicalParser)) {
+        Add-Failure 'Guarded-normalization porcelain semantics rejected canonical synthetic fixtures.'
+    }
+
+    # fixture自体が空配列の常時返却やskip漏れを見逃す形へ退行していないことを
+    # adversarial parserで検証する。
+    $semanticMutations = @(
+        [pscustomobject]@{
+            Name = 'always-empty parser'
+            Parser = {
+                param($RepoPath, $Raw)
+                return @()
+            }
+        },
+        [pscustomobject]@{
+            Name = 'rename/delete inclusion'
+            Parser = {
+                param($RepoPath, $Raw)
+                $values = @(
+                    Get-GuardedNormalizationCandidatePaths `
+                        -RepoPath $RepoPath `
+                        -Raw $Raw
+                )
+                if ($Raw.Contains('R  ')) {
+                    $values += Join-Path $RepoPath 'renamed.md'
+                }
+                if ($Raw.Contains(' D ')) {
+                    $values += Join-Path $RepoPath 'deleted.txt'
+                }
+                return $values
+            }
+        }
+    )
+    foreach ($mutation in $semanticMutations) {
+        if (Test-GuardedNormalizationPorcelainSemantics `
+                -Parser $mutation.Parser) {
+            Add-Failure (
+                'Guarded-normalization semantic fixtures accepted mutation: ' +
+                $mutation.Name
+            )
+        }
+    }
+
+    # source validatorへarray/scoping/skipの代表mutationを通し、
+    # correct-looking decoyや重複blockでも合格しないことを固定する。
+    $expectedBlock = Get-GuardedNormalizationExpectedEnumerationBlock
+    $sourceMutations = @(
+        [pscustomobject]@{
+            Name = 'scalar entries assignment'
+            Source = $source.Replace(
+                '[string[]]$entries = @(',
+                '$entries = ('
+            )
+        },
+        [pscustomobject]@{
+            Name = 'rename old-path token not skipped'
+            Source = $source.Replace(
+                '    if ($status -match ''R'') { $i++; continue }',
+                '    if ($status -match ''R'') { continue }'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'deleted entry included'
+            Source = $source.Replace(
+                '    if ($status -match ''D'') { continue }',
+                '    if ($status -match ''D'') { $files += Join-Path $repo $path; continue }'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'correct block relocated as decoy'
+            Source = $source.Replace($expectedBlock, '') +
+                "`n" + $expectedBlock
+        },
+        [pscustomobject]@{
+            Name = 'duplicate enumeration block'
+            Source = $source.Replace(
+                $expectedBlock,
+                $expectedBlock + "`n" + $expectedBlock
+            )
+        }
+    )
+    foreach ($mutation in $sourceMutations) {
+        if ($mutation.Source -ceq $source) {
+            Add-Failure (
+                'Guarded-normalization source mutation setup made no change: ' +
+                $mutation.Name
+            )
+        } elseif (Test-GuardedNormalizationExampleContract `
+                -Source $mutation.Source) {
+            Add-Failure (
+                'Guarded-normalization source validator accepted mutation: ' +
+                $mutation.Name
+            )
+        }
+    }
+}
+
 function Test-PosixContainmentEvidenceContract {
     param(
         [string]$ProcessSource,
@@ -2205,6 +2544,8 @@ Assert-ScannerHasOnlyBoundedRegexOperations `
     -RelativePath 'scripts/scan-private-markers.ps1'
 Assert-ScannerRegexPolicyValidatorRegressions `
     -RelativePath 'scripts/scan-private-markers.ps1'
+Assert-GuardedNormalizationExampleValidatorRegressions `
+    -RelativePath 'examples/guarded-normalization.md'
 
 Assert-FileHasUtf8Bom -RelativePath 'scripts/scan-private-markers.ps1'
 Assert-FileHasUtf8Bom -RelativePath 'scripts/test-scan-private-markers.ps1'

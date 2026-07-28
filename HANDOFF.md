@@ -1,6 +1,38 @@
 # HANDOFF
 
-更新日: 2026-07-27 (JST)
+更新日: 2026-07-28 (JST)
+
+## Current goal (Class M)
+
+- 目的: `git status --porcelain=v1 -z` が0件・1件・複数件のどの場合も、
+  guarded-normalization例がrecord列を同じ配列型として扱えるようにする。
+- 影響: copy-adaptable exampleとreadinessのsynthetic contractだけを変更する。
+  scanner runtime、利用者の実ファイル、repository全体の改行には触れない。
+- RED: 1 recordだけを現行parserへ渡すと、pipeline出力が`System.String`へ
+  scalar化され、`$entries[0]`が`System.Char`となって`Substring()`に失敗する。
+
+## Current success metrics
+
+- NUL区切りsynthetic inputで0 / 1 / multiple cardinalityをPS7 / PS5.1で通す。
+- 日本語名・空白名を保持し、rename pairとdeleteを従来どおりskipする。
+- exampleの明示array contractと意味fixtureをmutationで崩すとreadinessが落ちる。
+- 実ファイル変換なしでfull validation、scan、UTF-8 hygiene、3 OS CIを通す。
+
+## Current verification
+
+- RED: 1件のsynthetic porcelain recordはPS7 / PS5.1の双方で
+  `System.String`へscalar化し、index後の`System.Char.Substring()`で失敗。
+- validator追加後、旧exampleは両runtimeでexact array-safe block欠落の
+  1件だけを報告してexit 1。
+- `[string[]]$entries = @(...)`適用後、0 / 1 / multiple、日本語 / 空白path、
+  rename pair / delete skip、source / semantic mutationを両runtimeでpass。
+- readiness / repo scanはPS7・PS5.1・Ubuntu 24.04でpass。Ubuntu scanは
+  Windows worktreeのgitdirがcontainer内で無効なため、read-only sourceを
+  container内の一時git indexへ登録して実測した。
+- PS7 full scanner suiteはexit 0（`Private marker scan self-test passed.`）。
+  PS5.1 full suiteはmachine-wide排他slot待ち、3 OS CIはPR後のため未確認。
+- Gitleaks dir / 直近4 commitsは0件、Semgrep `p/security-audit`は
+  24 files / 0 findings。tracked 24 filesのUTF-8 / BOM / LF hygieneも全項目0。
 
 ## Current state
 
@@ -10,8 +42,10 @@
   [post-main run 30240311896](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30240311896)
   はWindows、Ubuntu 24.04、macOS 15の全job・全stepが成功。
 - open PR / issue / 必須の既知修正: このhandoff作成時点ではなし。
+- 2026-07-28のlive確認では`main == origin/main == a84f725`、open PR / issue
+  は0件、main run `30240973453`は3 OS success。
 
-## Latest delivered work (Class M)
+## Previous delivered work (Class M)
 
 - 目的: private-marker scanner が所有する Git isolation root の再帰削除を、
   OS temp 直下の exact-prefix + GUID 名を持つ通常directoryだけに限定する。
@@ -19,7 +53,7 @@
   directoryへ置換された場合は、再帰削除せず固定診断でfail closedする。
 - 非対象: 実文書のencoding変換、repository全体の改行正規化、release、deploy。
 
-## Success metrics
+## Previous success metrics
 
 - run固有owner markerと削除直前のroot / marker再取得で、check/use間の
   regular directory差替えとreparse差替えを拒否する。
@@ -72,5 +106,6 @@
 
 ## Next steps
 
-新しいissue、PR feedback、CI failureがなければ、実ユーザー文書を変更せず、
-synthetic fixtureで証明できる次のlocal-safe Class S/M改善を選ぶ。
+1. 排他slotでPS5.1 full scanner suiteを完走する。
+2. exact freezeの独立review後、PR / 3 OS CI、mergeを完了する。
+3. post-mainを再実測し、worktreeとbranchをcleanupする。
