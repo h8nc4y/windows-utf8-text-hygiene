@@ -294,7 +294,27 @@ git diff --cached --check
 
 The GitHub Actions workflow runs the same validation, scan self-test,
 private-marker scan, and whitespace check on pull requests and pushes to
-`main`. Windows runs the self-test separately under PowerShell 7 and
+`main`. Every canonical checkout step in workflow YAML disables credential
+persistence, so the workflow token is not retained for later validation steps.
+For deterministic validation, active `uses` mappings are unquoted, single-line
+canonical YAML; escaped, aliased, explicit, folded, and flow-collection forms are
+rejected rather than decoded. Explicit YAML tags (including bare `!` and
+percent-escaped suffixes), document markers, and all YAML directives are also
+unsupported. Credential hardening
+applies only to the exact
+`actions/checkout@<40-lowercase-sha>` reference, not a local or third-party
+action whose path merely ends in `checkout`. Flow collections (mapping or
+sequence) are intentionally unsupported, including run-only steps and benign
+forms such as `on: [push]`.
+Multiline quoted, plain, or block scalar content in mapping values and bare
+sequence items is excluded from mapping inspection; escaped double quotes and
+doubled single quotes keep quoted scalars open, while plain scalars close on
+dedent. Anchor, alias, tag, and flow indicators are rejected only where they
+start a YAML node or mapping value; identical text inside a quoted scalar,
+inline comment, or ordinary `run` shell text is not structural YAML.
+Official checkout may use either expanded `uses:` or canonical
+compact `- uses:` step syntax, with the same immediate credential input.
+Windows runs the self-test separately under PowerShell 7 and
 Windows PowerShell 5.1; Ubuntu 24.04 runs the PowerShell 7 self-test to
 exercise both its normal external `setsid` path and the forced native
 `setsid(2)` fallback. The macOS 15 job uses PowerShell 7 only and exercises

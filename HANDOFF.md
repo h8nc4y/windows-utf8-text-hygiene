@@ -1,6 +1,33 @@
 # HANDOFF
 
-更新日: 2026-07-28 (JST)
+更新日: 2026-07-30 (JST)
+
+## Current delivery (Class M)
+
+- 目的: CI checkout が後続 step の Git config に認証情報を残さないよう、
+  全workflow YAMLのcanonical checkoutでcredential persistenceを無効化する
+  （現在のWindows / Ubuntu / macOSの3 checkoutを含む）。
+- 影響: workflow YAML全canonical checkoutと、同じworkflow contractを検証する
+  readinessのsynthetic mutationに限定する。active `uses` はunquotedかつ
+  single-line canonical YAMLのみを許可し、escape / alias / explicit / folded /
+  flow collection（mapping / sequence）、explicit YAML tag、document marker、
+  YAML directiveをfail closedにする。credential入力の対象は完全一致する
+  `actions/checkout@<40-lowercase-sha>`だけで、末尾名`checkout`のlocal/third-party
+  actionは対象外とする。mapping valueとbare sequence itemのmultiline
+  quoted/plain/block scalar continuationはmapping検査から除外する。構造位置の
+  anchor / alias / tag / flowだけを拒否し、expanded/compact `uses`の両形式へ
+  同じcredential契約を適用する。
+- ローカル検証: PowerShell 7 / Windows PowerShell 5.1 のreadiness、
+  scanner full self-test、repository scanはすべて成功。Gitleaksはworking treeと
+  全9 commitsで0件、Semgrepは24 tracked filesで0 findings。変更6 filesの
+  strict UTF-8、意図的BOM例外、LF、行末空白、NUL、EOF改行、diff checkも成功。
+- review: 最終validatorとpublic-safe fixture差分は独立reviewでP0 / P1 / P2 /
+  P3各0。repository scanが初回に検出したsynthetic drive-absolute pathは、
+  backslashの字句fixtureを保つ相対表現へ置換して両runtimeで再検証した。
+- GitHub evidence: PR head / post-mainの3 OS CIは実行後にのみ記録する。
+  `actionlint`は未確認。
+- 非対象: action pin、trigger、permissions、job、runner、timeout、command、
+  利用者の実ファイル変換、release、deploy、secret、外部 API は変更しない。
 
 ## Latest delivered work (Class M)
 
