@@ -58,6 +58,29 @@ possible secret format and is no substitute for keeping real credentials
 out of the repository in the first place. Treat a passing scan as "no
 known marker found," not "definitely safe."
 
+Every canonical checkout step in workflow YAML disables credential persistence.
+This keeps the workflow token out of later validation steps; the readiness
+contract rejects missing, enabled, misplaced, borrowed, or duplicate settings.
+Active `uses` mappings must also use the unquoted, single-line canonical form.
+Escaped, aliased, explicit, folded, and flow-collection YAML forms are rejected
+rather than decoded, so a semantic checkout cannot bypass this contract.
+Explicit YAML tags, including bare/standard/custom/verbatim and percent-escaped
+forms, document markers, and all YAML directives are unsupported for the same
+reason.
+The credential input applies only to the exact
+`actions/checkout@<40-lowercase-sha>` reference, not a local or third-party
+action whose path merely ends in `checkout`. Flow collections (mapping or
+sequence) are intentionally unsupported, including run-only steps and benign
+forms such as `on: [push]`, because this lexical policy does not partially
+decode nested flow values.
+Multiline quoted, plain, or block scalar continuation lines in mapping values
+and bare sequence items are not mapping syntax. Quoted continuations end at the
+closing quote; plain continuations end at dedent. Anchor, alias, tag, and flow
+indicators are rejected at structural node/value starts, without treating the
+same characters in quoted scalars, inline comments, or ordinary `run` shell
+text as YAML structure. Canonical compact `- uses:` checkout steps remain
+subject to the same immediate credential input.
+
 When Git is available, tracked-file enumeration runs in finite-time child
 processes with a sanitized environment and isolated configuration.
 On Windows, the requested executable is created suspended with a

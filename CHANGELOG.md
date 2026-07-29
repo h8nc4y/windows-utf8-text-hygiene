@@ -8,6 +8,24 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Disabled persisted checkout credentials in the Windows, Ubuntu, and macOS
+  validation jobs, and require the same setting for every canonical checkout
+  in workflow YAML. The readiness contract now rejects a missing, enabled,
+  misplaced, borrowed, or duplicate credential-persistence setting, plus
+  escaped, aliased, explicit, folded, and flow-collection active `uses` forms.
+  Explicit YAML tags (including bare `!` and percent-escaped suffixes), document
+  markers, and all YAML directives are also rejected.
+  The policy matches the full official checkout reference and does not treat
+  local or third-party `*/checkout` actions as credential-bearing checkout;
+  flow collections remain unsupported even for run-only steps or benign
+  trigger sequences such as `on: [push]`.
+  Multiline quoted, plain, and block scalar continuations in mapping values or
+  bare sequence items are excluded from mapping inspection until closing quote
+  or dedent. Structural anchor/alias/tag/flow guards no longer misread quoted
+  scalar text, inline comments, or ordinary `run` text, while canonical compact
+  `- uses:` checkout steps receive the same credential contract as expanded
+  steps.
+
 - Kept the guarded-normalization porcelain parser array-stable for zero,
   one, or multiple NUL-delimited records. Synthetic PowerShell 7 and
   Windows PowerShell 5.1 readiness fixtures preserve Japanese and
