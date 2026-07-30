@@ -2,7 +2,7 @@
 
 更新日: 2026-07-30 (JST)
 
-## Current delivery (Class M)
+## Latest delivery (PR #11, Class M)
 
 - 目的: Windows PowerShell 5.1で実行する日本語commented `.ps1` 4本の
   UTF-8 BOM例外を、byte-level検査だけでなく`.editorconfig`でも予防する。
@@ -23,7 +23,16 @@
   残存process 0を確認後のbounded background再実行はexit 0、stderr 0 bytes。
 - review: 初回独立reviewのP2 1件（後置non-BOM charsetのfalse-green）を修正。
   再reviewはP0 / P1 / P2 / P3各0、CLEARANCE YES。
-- 未確認: global pre-commit hook、push、PR、3 OS CI。
+- commit `204823c6afc500591aaf34de97677f569c9f15d6`ではglobal
+  pre-commit hookを省略せず、staged Gitleaksは成功。Semgrepは
+  対象staged sourceなしとしてskip。
+- GitHub evidence: [PR #11](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/11)の
+  [head run 30525194142](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30525194142)は
+  Windows / Ubuntu 24.04 / macOS 15の全jobが成功。
+  [post-main run 30525679640](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30525679640)は、
+  初回Windows jobだけ合成Gitコンパイルの一時失敗で落ちたが、failed-job
+  rerunのattempt 2でWindows jobが成功し、run全体が3 OS成功状態となった。
+  `actionlint`は未確認。
 - 非対象: 利用者fileのencoding変換、repository全体の改行正規化、release、
   deploy、secret、外部 API は変更しない。
 
@@ -93,14 +102,13 @@
 
 ## Current state
 
-- 実装baseは[PR #10](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/10)の
-  merge commit `d3da73a2d3a0501eddba466cb6bc5ded99f1966c`、tree
-  `19c10e74021dc0abdc05760541cff0d91c085795`。
-- PR #10のhead run `30512305301`とpost-main run `30512502734`は、
-  Windows / Ubuntu 24.04 / macOS 15の全jobが成功。
-- task branchは`fix/editorconfig-bom-allowlist`。main checkoutの未追跡WIPを
-  読み込まず、origin/main起点の隔離worktreeだけで変更している。
-- 着手時点のopen PR / issueは0件。今回のpush / PR / CIは未実施。
+- PR #11のmerge commitは
+  `d6a617f3804491e7a4514b9df7ab7ac17d3a18a6`、tree
+  `c4d44de5bb38c0d5b6ed18f95bfb38c194e5e987`。
+- implementation branchはmerge済み。origin/main起点の隔離worktreeだけで
+  変更し、main checkoutのtracked stateと無関係な未追跡内容には触れていない。
+- PS5.1対象4本のbyte-level BOM契約と`.editorconfig`契約は一致。
+  利用者fileの変換、release、deploy、外部API実行、費用発生はない。
 
 ## Previous delivered work (Class M)
 
@@ -163,5 +171,7 @@
 
 ## Next steps
 
-独立reviewでP0 / P1 / P2 / P3を確認する。validated findingを修正して再検証後、
-focused commit、push、PR、3 OS CI、merge、隔離worktree cleanupへ進む。
+PR #11の実装作業は完了。Windows CIの合成Gitコンパイル失敗が再発する場合は、
+別のClass M taskでcompile結果のexit / stream診断をfailureへ含め、precondition
+失敗後にtimeout fixtureを続行しない契約を追加する。attempt 2成功だけを
+flakiness解消の証明にはしない。`actionlint`は未確認。
