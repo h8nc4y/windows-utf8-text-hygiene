@@ -24,12 +24,14 @@
 - review: 最終validatorとpublic-safe fixture差分は独立reviewでP0 / P1 / P2 /
   P3各0。repository scanが初回に検出したsynthetic drive-absolute pathは、
   backslashの字句fixtureを保つ相対表現へ置換して両runtimeで再検証した。
-- GitHub evidence: PR head / post-mainの3 OS CIは実行後にのみ記録する。
-  `actionlint`は未確認。
+- GitHub evidence: [PR #9](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/9)の
+  [head run 30497420072](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30497420072)と
+  [post-main run 30497764598](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30497764598)は、
+  Windows / Ubuntu 24.04 / macOS 15の全jobが成功。`actionlint`は未確認。
 - 非対象: action pin、trigger、permissions、job、runner、timeout、command、
   利用者の実ファイル変換、release、deploy、secret、外部 API は変更しない。
 
-## Latest delivered work (Class M)
+## Previous delivered work (PR #7, Class M)
 
 - 目的: `git status --porcelain=v1 -z` が0件・1件・複数件のどの場合も、
   guarded-normalization例がrecord列を同じ配列型として扱えるようにする。
@@ -45,7 +47,7 @@
 - exampleの明示array contractと意味fixtureをmutationで崩すとreadinessが落ちる。
 - 実ファイル変換なしでfull validation、scan、UTF-8 hygiene、3 OS CIを通す。
 
-## Current verification
+## Previous verification (PR #7)
 
 - RED: 1件のsynthetic porcelain recordはPS7 / PS5.1の双方で
   `System.String`へscalar化し、index後の`System.Char.Substring()`で失敗。
@@ -66,14 +68,14 @@
 
 ## Current state
 
-- 最新の機能変更はPR #7で`main`へsquash merge済み。merge commitは
-  `245b9e554753d84c884390b6aef279104b2799c1`。
-- [PR run 30340730616](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30340730616)
-  と
-  [post-main run 30341194328](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30341194328)
-  はWindows、Ubuntu 24.04、macOS 15の全jobが成功。
-- `origin/main` treeはレビュー済みtree
-  `386be10b892d4d580a84b97bbb19753590b1189c`と一致。
+- 最新の機能変更は[PR #9](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/9)で
+  `main`へmerge済み。head commitは`b0a4b067b28a020587f42b9e005e5b411dd0a593`、
+  merge commitは`94ad4c763edc744427f7bde7d6dbc31da91ba62e`。
+- PR head run `30497420072`とpost-main run `30497764598`は、
+  Windows / Ubuntu 24.04 / macOS 15の全jobが成功。
+- `main` / `origin/main` / GitHub `main`は
+  `94ad4c763edc744427f7bde7d6dbc31da91ba62e`、treeは
+  `86b65176718a776b2e9da1f18e4f56f67a010c4c`で一致。
 - open PR / issue / 必須の既知修正は0件。implementation task branchと
   隔離worktreeはcleanup済み。
 
