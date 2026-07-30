@@ -8,6 +8,12 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Mirrored the Windows PowerShell 5.1 BOM exception in `.editorconfig` with
+  exact per-file `utf-8-bom` sections for the four scripts that 5.1 executes.
+  The readiness contract uses synthetic mutations to reject a missing or
+  duplicate exact override and any repository-wide or scripts-directory
+  wildcard BOM assignment. It also rejects later non-BOM or `unset` charset
+  assignments that would override an exact exception.
 - Disabled persisted checkout credentials in the Windows, Ubuntu, and macOS
   validation jobs, and require the same setting for every canonical checkout
   in workflow YAML. The readiness contract now rejects a missing, enabled,
