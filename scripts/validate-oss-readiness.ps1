@@ -3341,6 +3341,259 @@ function Assert-ScannerRegexPolicyValidatorRegressions {
     }
 }
 
+function Test-EditorConfigUtf8BomAllowlistContent {
+    param([string]$Content)
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return $false
+    }
+
+    # PS5.1対象だけをallowlist化する。wildcard sectionは将来追加される
+    # pwsh-only scriptへ不要なBOMを波及させるため、同値扱いにしない。
+    $allowlist = @(
+        [pscustomobject]@{
+            Path = 'scripts/private-marker-process.ps1'
+            SectionCount = 0
+            BomAssignmentCount = 0
+        },
+        [pscustomobject]@{
+            Path = 'scripts/scan-private-markers.ps1'
+            SectionCount = 0
+            BomAssignmentCount = 0
+        },
+        [pscustomobject]@{
+            Path = 'scripts/test-scan-private-markers.ps1'
+            SectionCount = 0
+            BomAssignmentCount = 0
+        },
+        [pscustomobject]@{
+            Path = 'scripts/validate-oss-readiness.ps1'
+            SectionCount = 0
+            BomAssignmentCount = 0
+        }
+    )
+    $globalSectionCount = 0
+    $globalUtf8AssignmentCount = 0
+    $normalizedContent = $Content.Replace("`r`n", "`n").Replace("`r", "`n")
+    $lines = $normalizedContent.Split(
+        [string[]]@("`n"),
+        [System.StringSplitOptions]::None
+    )
+    $currentSection = $null
+
+    foreach ($rawLine in $lines) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or
+            $line.StartsWith('#') -or
+            $line.StartsWith(';')) {
+            continue
+        }
+
+        # section headerを厳密に切り出す。allowlist pathはcase-sensitiveな
+        # repository相対pathとして比較し、別OSで異なる対象へ展開させない。
+        if ($line.StartsWith('[')) {
+            $sectionMatch = [regex]::Match(
+                $line,
+                '^\[(?<name>[^\[\]]+)\]$',
+                [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+            )
+            if (-not $sectionMatch.Success) {
+                return $false
+            }
+            $currentSection = $sectionMatch.Groups['name'].Value
+            if ($currentSection -ceq '*') {
+                $globalSectionCount++
+            }
+            foreach ($entry in $allowlist) {
+                if ($entry.Path -ceq $currentSection) {
+                    $entry.SectionCount++
+                }
+            }
+            continue
+        }
+
+        # EditorConfig/INIで使われる「=」「:」の両assignmentを認識し、
+        # 表記を変えたbroad overrideも検査外へ逃がさない。
+        $assignmentMatch = [regex]::Match(
+            $line,
+            '^(?<key>[^=:#\s][^=:]*?)\s*(?:=|:)\s*(?<value>.*)$',
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+        if (-not $assignmentMatch.Success -or
+            $assignmentMatch.Groups['key'].Value.Trim() -ine 'charset') {
+            continue
+        }
+
+        $value = $assignmentMatch.Groups['value'].Value.Trim()
+        $matchedAllowlistEntry = $null
+        foreach ($entry in $allowlist) {
+            if ($entry.Path -ceq $currentSection) {
+                $matchedAllowlistEntry = $entry
+                break
+            }
+        }
+
+        if ($null -ne $matchedAllowlistEntry) {
+            if ($value -ine 'utf-8-bom') {
+                return $false
+            }
+            $matchedAllowlistEntry.BomAssignmentCount++
+        } elseif ($currentSection -ceq '*') {
+            # global defaultはBOMなしUTF-8の1件だけを許可する。後置のunsetや
+            # 別値でexact overrideを打ち消すEditorConfigの後勝ちも拒否する。
+            if ($value -ine 'utf-8') {
+                return $false
+            }
+            $globalUtf8AssignmentCount++
+        } else {
+            # 任意globの包含判定を部分実装せず、allowlist外charsetをfail closedにする。
+            # これによりexact section後のwildcard overrideもfalse-greenにしない。
+            return $false
+        }
+    }
+
+    # global defaultと4 exceptionを各1件へ固定し、欠落・重複を同時に拒否する。
+    if ($globalSectionCount -ne 1 -or
+        $globalUtf8AssignmentCount -ne 1) {
+        return $false
+    }
+    foreach ($entry in $allowlist) {
+        if ($entry.SectionCount -ne 1 -or
+            $entry.BomAssignmentCount -ne 1) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-EditorConfigUtf8BomAllowlist {
+    param([string]$RelativePath)
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath (UTF-8 BOM allowlist contract)"
+        return
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $content = [System.IO.File]::ReadAllText($filePath, $strictUtf8)
+    }
+    catch {
+        Add-Failure "$RelativePath must be strict UTF-8."
+        return
+    }
+
+    if (-not (Test-EditorConfigUtf8BomAllowlistContent -Content $content)) {
+        Add-Failure (
+            "$RelativePath must define one global utf-8 default and assign " +
+            'utf-8-bom exactly once to each Windows PowerShell 5.1 script, ' +
+            'with no other charset assignments.'
+        )
+    }
+}
+
+function Assert-EditorConfigUtf8BomAllowlistValidatorRegressions {
+    param([string]$RelativePath)
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $content = [System.IO.File]::ReadAllText($filePath, $strictUtf8)
+    }
+    catch {
+        return
+    }
+    $normalizedContent = $content.Replace("`r`n", "`n").Replace("`r", "`n")
+    if (-not (Test-EditorConfigUtf8BomAllowlistContent `
+            -Content $normalizedContent)) {
+        return
+    }
+
+    $firstOverride = @'
+[scripts/private-marker-process.ps1]
+charset = utf-8-bom
+'@
+    $missingOverride = $normalizedContent.Replace(
+        $firstOverride + "`n`n",
+        ''
+    )
+    $duplicateSection = (
+        $normalizedContent.TrimEnd([char[]]@("`r", "`n")) +
+        "`n`n" +
+        $firstOverride +
+        "`n"
+    )
+    $duplicateAssignment = $normalizedContent.Replace(
+        $firstOverride,
+        $firstOverride + "`ncharset = utf-8-bom"
+    )
+    $externalCharsetOverrides = @(
+        [pscustomobject]@{
+            Name = 'repository-wide PowerShell BOM override'
+            Section = '*.ps1'
+            Value = 'utf-8-bom'
+        },
+        [pscustomobject]@{
+            Name = 'scripts-directory wildcard BOM override'
+            Section = 'scripts/*.ps1'
+            Value = 'utf-8-bom'
+        },
+        [pscustomobject]@{
+            Name = 'later scripts-directory non-BOM override'
+            Section = 'scripts/*.ps1'
+            Value = 'utf-8'
+        },
+        [pscustomobject]@{
+            Name = 'later global charset reset'
+            Section = '*'
+            Value = 'unset'
+        }
+    )
+    $mutations = @(
+        [pscustomobject]@{
+            Name = 'missing exact override'
+            Content = $missingOverride
+        },
+        [pscustomobject]@{
+            Name = 'duplicate exact section'
+            Content = $duplicateSection
+        },
+        [pscustomobject]@{
+            Name = 'duplicate charset assignment'
+            Content = $duplicateAssignment
+        }
+    )
+    foreach ($externalOverride in $externalCharsetOverrides) {
+        $mutations += [pscustomobject]@{
+            Name = $externalOverride.Name
+            Content = (
+                $normalizedContent.TrimEnd([char[]]@("`r", "`n")) +
+                "`n`n[$($externalOverride.Section)]`n" +
+                "charset = $($externalOverride.Value)`n"
+            )
+        }
+    }
+
+    # synthetic textだけをvalidatorへ通し、実scriptや利用者fileは変更しない。
+    foreach ($mutation in $mutations) {
+        if ($mutation.Content -ceq $normalizedContent) {
+            Add-Failure (
+                'EditorConfig BOM allowlist mutation setup made no change: ' +
+                $mutation.Name
+            )
+        } elseif (Test-EditorConfigUtf8BomAllowlistContent `
+                -Content $mutation.Content) {
+            Add-Failure (
+                'EditorConfig BOM allowlist validator accepted mutation: ' +
+                $mutation.Name
+            )
+        }
+    }
+}
+
 function Assert-FileHasUtf8Bom {
     param([string]$RelativePath)
 
@@ -3644,6 +3897,9 @@ Assert-ScannerRegexPolicyValidatorRegressions `
 Assert-GuardedNormalizationExampleValidatorRegressions `
     -RelativePath 'examples/guarded-normalization.md'
 
+Assert-EditorConfigUtf8BomAllowlist -RelativePath '.editorconfig'
+Assert-EditorConfigUtf8BomAllowlistValidatorRegressions `
+    -RelativePath '.editorconfig'
 Assert-FileHasUtf8Bom -RelativePath 'scripts/scan-private-markers.ps1'
 Assert-FileHasUtf8Bom -RelativePath 'scripts/test-scan-private-markers.ps1'
 Assert-FileHasUtf8Bom -RelativePath 'scripts/private-marker-process.ps1'

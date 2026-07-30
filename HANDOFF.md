@@ -4,6 +4,31 @@
 
 ## Current delivery (Class M)
 
+- 目的: Windows PowerShell 5.1で実行する日本語commented `.ps1` 4本の
+  UTF-8 BOM例外を、byte-level検査だけでなく`.editorconfig`でも予防する。
+- 影響: `.editorconfig`は対象4pathへだけ`charset = utf-8-bom`を各1回指定し、
+  `[*.ps1]` / `[scripts/*.ps1]`のwildcardで将来のpwsh-only scriptへ
+  BOMを波及させない。readinessは同じexact allowlistをsynthetic textで検証する。
+- TDD: 対象関数なし、既存`.editorconfig`の契約不適合を順にRED確認。
+  exact 4 section追加後、canonical / 欠落 / section重複 / assignment重複 /
+  repository-wide wildcard / scripts-directory wildcard / 後置non-BOM /
+  後置global `unset` fixtureは、PowerShell 7とWindows PowerShell 5.1の
+  対象抽出testで成功。
+- ローカル検証: PowerShell 7 / Windows PowerShell 5.1のreadiness、
+  scanner self-test、repository scanは成功。tracked 24 filesのUTF-8 hygieneは
+  findings 0で、BOMはPS5.1対象4本だけ。unstaged / staged diff checkも成功。
+- security: Gitleaks 8.30.1はworking treeと全11 commitsで0件。
+  Semgrep 1.165.0 `p/security-audit`は24 files / 2 rules / 0 findings。
+- 実行メモ: PS7 self-testの初回foreground実行は180秒でtimeoutしたが、
+  残存process 0を確認後のbounded background再実行はexit 0、stderr 0 bytes。
+- review: 初回独立reviewのP2 1件（後置non-BOM charsetのfalse-green）を修正。
+  再reviewはP0 / P1 / P2 / P3各0、CLEARANCE YES。
+- 未確認: global pre-commit hook、push、PR、3 OS CI。
+- 非対象: 利用者fileのencoding変換、repository全体の改行正規化、release、
+  deploy、secret、外部 API は変更しない。
+
+## Previous delivered work (PR #9, Class M)
+
 - 目的: CI checkout が後続 step の Git config に認証情報を残さないよう、
   全workflow YAMLのcanonical checkoutでcredential persistenceを無効化する
   （現在のWindows / Ubuntu / macOSの3 checkoutを含む）。
@@ -68,16 +93,14 @@
 
 ## Current state
 
-- 最新の機能変更は[PR #9](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/9)で
-  `main`へmerge済み。head commitは`b0a4b067b28a020587f42b9e005e5b411dd0a593`、
-  merge commitは`94ad4c763edc744427f7bde7d6dbc31da91ba62e`。
-- PR head run `30497420072`とpost-main run `30497764598`は、
+- 実装baseは[PR #10](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/10)の
+  merge commit `d3da73a2d3a0501eddba466cb6bc5ded99f1966c`、tree
+  `19c10e74021dc0abdc05760541cff0d91c085795`。
+- PR #10のhead run `30512305301`とpost-main run `30512502734`は、
   Windows / Ubuntu 24.04 / macOS 15の全jobが成功。
-- `main` / `origin/main` / GitHub `main`は
-  `94ad4c763edc744427f7bde7d6dbc31da91ba62e`、treeは
-  `86b65176718a776b2e9da1f18e4f56f67a010c4c`で一致。
-- open PR / issue / 必須の既知修正は0件。implementation task branchと
-  隔離worktreeはcleanup済み。
+- task branchは`fix/editorconfig-bom-allowlist`。main checkoutの未追跡WIPを
+  読み込まず、origin/main起点の隔離worktreeだけで変更している。
+- 着手時点のopen PR / issueは0件。今回のpush / PR / CIは未実施。
 
 ## Previous delivered work (Class M)
 
@@ -99,11 +122,11 @@
 
 ## Key files
 
-- `scripts/private-marker-process.ps1`: owned cleanup boundary。
-- `scripts/scan-private-markers.ps1`: scannerの3 cleanup経路。
-- `scripts/test-scan-private-markers.ps1`: hostile synthetic regression。
-- `scripts/validate-oss-readiness.ps1`: source / test / cleanup callsite契約。
-- `README.md` / `SECURITY.md` / `CHANGELOG.md`: 公開契約。
+- `.editorconfig`: PS5.1対象4pathのexact `utf-8-bom` allowlist。
+- `scripts/validate-oss-readiness.ps1`: allowlist parserとsynthetic mutations。
+- `README.md` / `examples/gitattributes-editorconfig-sample.md`: 利用者向け契約。
+- `CHANGELOG.md` / `HANDOFF.md`: current deliveryと検証状態。
+- `scripts/*.ps1` 4本: 実byte-level BOM契約。内容自体は変更しない。
 
 ## Recent decisions
 
@@ -140,5 +163,5 @@
 
 ## Next steps
 
-新しいissue、PR feedback、CI failureがなければ、利用者の実ファイルを変更せず、
-synthetic fixtureで証明できる次のlocal-safe Class S/M改善を選ぶ。
+独立reviewでP0 / P1 / P2 / P3を確認する。validated findingを修正して再検証後、
+focused commit、push、PR、3 OS CI、merge、隔離worktree cleanupへ進む。

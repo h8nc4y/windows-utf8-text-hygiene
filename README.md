@@ -180,6 +180,10 @@ validates that exception and
 the whitespace rules on every push and pull request
 (`git diff-tree --check` against the empty tree), and the skill's own
 inspection commands were run against the repository before publication.
+The root `.editorconfig` mirrors the exception with one exact
+`charset = utf-8-bom` section for each of those four scripts. It deliberately
+does not use a `*.ps1` wildcard, so a future PowerShell 7-only script does not
+inherit an unnecessary BOM.
 
 ## 日本語概要 (Japanese Overview)
 
@@ -344,6 +348,11 @@ ownership claim.
 Cleanup reacquires both the regular, non-reparse root and that marker
 immediately before recursive removal, so a regular-directory or reparse
 replacement between the first check and deletion fails closed.
+The readiness contract also keeps the EditorConfig exception aligned with the
+byte-level checks: the four PowerShell 5.1 scripts must each have exactly one
+file-scoped `utf-8-bom` assignment. Synthetic text mutations reject missing or
+duplicate assignments, wildcard BOM expansion, and later non-BOM or `unset`
+charset overrides that would cancel the exception.
 On Windows, the requested executable is created suspended with only its
 three standard-I/O handles inheritable, assigned to a kill-on-close Job,
 and resumed only after assignment. An immediately spawning command

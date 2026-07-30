@@ -76,9 +76,13 @@ Notes and deliberate choices:
   charset = utf-8-bom
   ```
 
-  Scope it to the specific files — a blanket `[*.ps1] utf-8-bom` rule
-  forces BOMs onto scripts that only ever run under `pwsh` 7, where they
-  are unnecessary.
+  Repeat an exact section for each additional Windows PowerShell 5.1 script.
+  Do not replace that allowlist with a blanket `[*.ps1]` or
+  `[scripts/*.ps1]` rule: either wildcard forces BOMs onto scripts that only
+  ever run under `pwsh` 7, where they are unnecessary. This repository
+  dogfoods that rule with four exact script sections, and its readiness
+  validator rejects missing, duplicate, broader BOM, and later non-BOM
+  assignments that would cancel an exact exception.
 - The `[Makefile]` section exists because TAB is syntax there; it also
   documents why control-character scans must exclude such files.
 
