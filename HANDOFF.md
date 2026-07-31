@@ -1,6 +1,28 @@
 # HANDOFF
 
-更新日: 2026-07-30 (JST)
+更新日: 2026-08-01 (JST)
+
+## Latest maintenance verification (2026-08-01, Class S)
+
+- 目的: workflow構文の未確認事項を解消し、実装を変えずに現在の
+  `.github/workflows/validate.yml`を公式actionlintで検証する。
+- provenance: 公式actionlint v1.7.12 releaseのWindows amd64 artifactを使用した。
+  download後のSHA-256はGitHub release API掲載値
+  `6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9`と一致した。
+- verification: `actionlint.exe -no-color .github/workflows/validate.yml`は
+  exit 0、finding 0。初回の`-color never`は現行CLIに存在しない引数形式のため
+  lint前にexit 3となり、`-help`で確認した`-no-color`へ修正して再実行した。
+- local gates: PowerShell 7 / Windows PowerShell 5.1のreadiness、scanner
+  self-test、repository scanは成功。self-testの実行時間はPS7が189.9秒、
+  PS5.1が117.3秒。PS7 repository scanの初回は外部GitHub Release URLを
+  `non-allowlisted-github-repo-url`として1件検出し、URL削除後は両runtimeで
+  finding 0となった。
+- security: Gitleaks 8.30.1はworking treeと全13 commitsで0件。
+  Semgrep 1.165.0 `p/security-audit`は24 tracked files / 2 rules /
+  0 findings。
+- review: 独立read-only reviewはP0 / P1 / P2 / P3各0、CLEAR。
+- 非対象: workflow、validator、scanner、利用者file、release、deploy、secret、
+  外部API、費用操作は変更しない。
 
 ## Latest delivery (PR #11, Class M)
 
@@ -102,12 +124,13 @@
 
 ## Current state
 
-- PR #11のmerge commitは
-  `d6a617f3804491e7a4514b9df7ab7ac17d3a18a6`、tree
-  `c4d44de5bb38c0d5b6ed18f95bfb38c194e5e987`。
+- `main`はPR #12のmerge commit
+  `75c8d6d7dcfd3087da10bfd5b83a3741a5459e24`。PR #11の実装merge commitは
+  `d6a617f3804491e7a4514b9df7ab7ac17d3a18a6`。
 - implementation branchはmerge済み。origin/main起点の隔離worktreeだけで
   変更し、main checkoutのtracked stateと無関係な未追跡内容には触れていない。
 - PS5.1対象4本のbyte-level BOM契約と`.editorconfig`契約は一致。
+  actionlint v1.7.12による現行workflowの検証もfinding 0。
   利用者fileの変換、release、deploy、外部API実行、費用発生はない。
 
 ## Previous delivered work (Class M)
@@ -174,4 +197,4 @@
 PR #11の実装作業は完了。Windows CIの合成Gitコンパイル失敗が再発する場合は、
 別のClass M taskでcompile結果のexit / stream診断をfailureへ含め、precondition
 失敗後にtimeout fixtureを続行しない契約を追加する。attempt 2成功だけを
-flakiness解消の証明にはしない。`actionlint`は未確認。
+flakiness解消の証明にはしない。workflow変更時はactionlintを再実行する。
