@@ -21,6 +21,10 @@
   Semgrep 1.165.0 `p/security-audit`は24 tracked files / 2 rules /
   0 findings。
 - review: 独立read-only reviewはP0 / P1 / P2 / P3各0、CLEAR。
+- GitHub evidence: [PR #13](https://github.com/h8nc4y/windows-utf8-text-hygiene/pull/13)の
+  [head run 30650773662](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30650773662)と
+  [post-main run 30651184545](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30651184545)は、
+  Windows / Ubuntu 24.04 / macOS 15の全jobが成功。
 - 非対象: workflow、validator、scanner、利用者file、release、deploy、secret、
   外部API、費用操作は変更しない。
 
@@ -124,11 +128,14 @@
 
 ## Current state
 
-- `main`はPR #12のmerge commit
-  `75c8d6d7dcfd3087da10bfd5b83a3741a5459e24`。PR #11の実装merge commitは
+- workflow / source behavior baselineはPR #11の実装merge commit
   `d6a617f3804491e7a4514b9df7ab7ac17d3a18a6`。
-- implementation branchはmerge済み。origin/main起点の隔離worktreeだけで
-  変更し、main checkoutのtracked stateと無関係な未追跡内容には触れていない。
+- delivery closeout docs baselineはPR #12のmerge commit
+  `75c8d6d7dcfd3087da10bfd5b83a3741a5459e24`。workflowとsourceは変更していない。
+- actionlint evidence baselineはdocs-only PR #13のmerge commit
+  `9107342b799187014122f062004b1ba441f88b5b`。workflowとsourceは変更していない。
+- 隔離worktreeだけで変更し、main checkoutのtracked stateと無関係な
+  未追跡内容には触れていない。
 - PS5.1対象4本のbyte-level BOM契約と`.editorconfig`契約は一致。
   actionlint v1.7.12による現行workflowの検証もfinding 0。
   利用者fileの変換、release、deploy、外部API実行、費用発生はない。
@@ -194,7 +201,8 @@
 
 ## Next steps
 
-PR #11の実装作業は完了。Windows CIの合成Gitコンパイル失敗が再発する場合は、
+PR #13のactionlint検証とintegrationは完了。Windows CIの合成Gitコンパイル失敗が
+再発する場合は、
 別のClass M taskでcompile結果のexit / stream診断をfailureへ含め、precondition
 失敗後にtimeout fixtureを続行しない契約を追加する。attempt 2成功だけを
 flakiness解消の証明にはしない。workflow変更時はactionlintを再実行する。
