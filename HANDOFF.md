@@ -1,13 +1,13 @@
 # HANDOFF
 
-更新日: 2026-08-03 06:34 JST
+更新日: 2026-08-03 06:49 JST
 
-## Current goal (Class M)
+## Completed goal (Class M)
 
-- `fix/guard-normalization-reparse` で destructive normalization 例を fail-closed 化する。
+- destructive normalization 例を fail-closed 化した。
 - 対象は `README.md`、`SKILL.md`、`docs/SKILL.ja.md`、
   `examples/guarded-normalization.md`、`scripts/validate-oss-readiness.ps1`、
-  `CHANGELOG.md`。isolated worktree上で作業する。
+  `CHANGELOG.md`。commit `2d53005` を PR #15 で main へ統合した。
 
 ## Decisions and guarantees
 
@@ -40,14 +40,21 @@
 - 変更7ファイルはstrict UTF-8。validatorだけ意図的BOMあり、CR/NUL/TABは全て0。
   `git diff --check`と`git diff --cached --check`はいずれもexit 0。
 - PowerShell、adversarial、docsの独立read-only reviewはfreeze版で全てCLEAR。
+- PR #15 は2026-08-03 06:42 JSTにmergeされ、merge commitは`e7cc3e7`。
+  post-main CI run `30768500967` は同日06:47 JSTまでに全3 jobがsuccess:
+  Ubuntu 1分58秒、Windows PowerShell 5.1を含むrepository 4分21秒、
+  macOS PowerShell 7 4分41秒。feature remote branchは削除済み。
 - system/global `trace2.*Target`を実設定したpositive semantic fixtureは同一failure
   classを3回試して改善せず撤去したため未確認。構造gateとGit公式仕様の確認は実施済み。
 
-## Protected state / next steps
+## Protected state / remaining boundaries
 
 - main checkoutのuntracked `.debug-intent-fixture/` は既存WIP。内容未読・変更禁止。
 - cleanup policyで拒否されたlocal temp residue
   `codex-032-gitmode-probe-27bae94d52ed4265889551116be4c807` は保持し、
   再試行しない。絶対pathは公開文書へ記録しない。
-- commit/push/PR/CI/merge/post-main/cleanupを行う。
+- 本タスクの実装・検証・review・PR統合・post-main確認は完了。次回は最新mainから
+  別の安全な優先タスクを選ぶ。
+- このcloseout文書のPR後にmainを`--ff-only`で更新し、docs branch / isolated
+  worktreeをcleanupする。保護WIPは保持する。
 - release / deploy / secret / OAuth / 実データ / paid operation は未実行・対象外。
