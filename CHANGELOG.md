@@ -32,12 +32,22 @@ The format loosely follows Keep a Changelog conventions.
   `- uses:` checkout steps receive the same credential contract as expanded
   steps.
 
-- Kept the guarded-normalization porcelain parser array-stable for zero,
-  one, or multiple NUL-delimited records. Synthetic PowerShell 7 and
-  Windows PowerShell 5.1 readiness fixtures preserve Japanese and
-  space-bearing paths while continuing to skip rename pairs and deletions;
-  source mutations reject scalar assignments, relocated decoys, duplicate
-  blocks, and weakened skip logic.
+- Replaced automatic guarded-normalization discovery with an explicit target
+  list so PowerShell native-output decoding cannot alias POSIX filenames that
+  contain CR or LF. Each explicit path must independently be a regular blob in
+  both HEAD and the stage-0 index, remain inside an ordinary non-reparse path
+  chain, and retain its raw-byte digest through the final write guard. Git
+  routing, config, pathspec, trace, replacement-object, and lazy-fetch
+  redirection fail closed; system/global Trace2 targets are suppressed during
+  the synchronous identity queries.
+  Diagnostics escape unsafe Unicode scalars, strict UTF-8 decoding strips
+  repeated BOMs, and CRLF plus lone CR normalize to LF. Independent AST and
+  mutation checks, caller-trace rejection, and real reparse fixtures exercise
+  the contract on PowerShell 7 and Windows PowerShell 5.1; Trace2 override
+  order and cleanup are asserted structurally, without recursively traversing
+  an unknown cleanup target. Because the final write is not atomic, a write
+  exception now stops immediately with a fixed path-free error and requires
+  recovery before normalization continues.
 - Added a bounded `macos-15` PowerShell 7 CI contract for the native POSIX
   session fallback. Run
   [30205393010](https://github.com/h8nc4y/windows-utf8-text-hygiene/actions/runs/30205393010)

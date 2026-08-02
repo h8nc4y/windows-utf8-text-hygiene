@@ -160,8 +160,11 @@ after every append.
   detection commands for BOM, CRLF, NUL bytes, and control-character
   contamination, in PowerShell and Git Bash / POSIX form.
 - [Guarded normalization](examples/guarded-normalization.md) — the
-  strict-decode-guarded normalization loop with its safety checklist, plus
-  the measured before/after of why the guard exists.
+  strict-decode-guarded normalization loop for an explicit target list, with
+  exact HEAD/index identity checks, Git-routing rejection, repository
+  containment, reparse-chain rejection, and a pre-write raw-byte digest check.
+  Its strict decoder strips repeated leading UTF-8 BOMs, and normalization
+  converts both CRLF and lone CR to LF.
 - [.gitattributes / .editorconfig sample](examples/gitattributes-editorconfig-sample.md)
   — a minimal pair of config files that prevent most of this document's
   problems from entering a new repository at all.
@@ -227,10 +230,37 @@ Same series — Windows agent-operations skills by the same maintainer:
 
 ## Safety Notes
 
-- Normalization is destructive: run it only on git-tracked files you can
-  restore, only after the strict UTF-8 decode passes, and never as a bulk
-  repository-wide CRLF→LF conversion (that belongs to `.gitattributes`
-  policy, not to this skill).
+- Normalization is destructive: list each target explicitly and run it only
+  when the same path is a regular blob (`100644` / `100755`) in both HEAD and
+  the stage-0 index. Reject untracked, intent-to-add, conflicted, symlink, and
+  submodule entries. Paths absent from HEAD—including typical staged additions
+  and new rename destinations—are rejected; an existing destination is judged
+  by its own HEAD/index identity because Git does not store a general rename
+  bit. Also reject ambient Git routing/config/pathspec/trace variables or a
+  top-level mismatch, and resolve Git as an application rather than an
+  alias/function. The selected PATH/application remains a trusted-host input.
+  The three synchronous identity queries set `GIT_TRACE2`,
+  `GIT_TRACE2_EVENT`, and `GIT_TRACE2_PERF` to `0` only for their process
+  window, then remove them in `finally`. Use a dedicated, single-threaded
+  PowerShell process; no other runspace, thread, or child launch in that
+  process may overlap the override window. `--no-lazy-fetch` prevents promisor-remote
+  access. Require lexical repository containment and an ordinary non-reparse
+  root/parent/leaf chain, then
+  reacquire the same Git identity, path boundary, and raw-byte digest
+  immediately before writing. Never bulk-convert repository line endings
+  (that belongs to `.gitattributes` policy, not to this skill).
+- The portable path checks are an accident guard for a trusted local
+  checkout, not a race-free sandbox. Hard links, Unix mount substitution,
+  and a path/content swap in the final digest-check/write window require
+  OS-specific no-follow handles and file-ID verification; do not normalize in
+  an untrusted concurrently writable tree.
+- Keep filesystem paths raw for API calls, but escape BMP and supplementary
+  control/format scalars, unpaired surrogates, and Unicode line/paragraph
+  separators in diagnostic labels before sending them to a terminal.
+- `WriteAllText` can fail after truncation. The pattern treats that exception
+  as fatal with a fixed path-free message; inspect the guarded target and
+  recover it from a trusted backup, HEAD, or the index as appropriate before
+  continuing.
 - A file that fails the strict decode is evidence of ANSI / Shift_JIS
   content. Converting its encoding is a separate decision to surface in
   your report — not a side effect to apply silently.

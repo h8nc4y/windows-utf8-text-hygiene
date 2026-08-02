@@ -129,8 +129,18 @@ with a BOM runs correctly under 5.1 — hence the exception.
 
 ### Normalization (destructive — every safety condition below must hold first)
 
-4. Run a strict UTF-8 decode first, and rewrite (BOM removal + LF + trailing
-   whitespace removal) **only the files that pass**. A plain
+4. List the target paths explicitly; do not derive them by capturing native
+   `git ... -z` output as PowerShell text, because that path loses embedded
+   CR/LF in valid POSIX filenames. Require each path to be a regular blob
+   (`100644` / `100755`) in both HEAD and the stage-0 index, reject ambient
+   Git routing/config variables and an exact top-level mismatch, and require
+   a regular non-reparse target whose entire parent chain stays inside the
+   repository. Reacquire the same HEAD/index mode/OID/stage, path boundary,
+   and raw-byte digest immediately before writing. The copy-adaptable helpers
+   are defined in [the guarded-normalization example](examples/guarded-normalization.md);
+   do not weaken them to `Test-Path`, a tracked-name check, or an automatic
+   status parser. Then run a strict UTF-8 decode and rewrite (BOM removal + LF
+   + trailing whitespace removal) **only the files that pass**. A plain
    `ReadAllText($path)` silently replaces invalid UTF-8 bytes with U+FFFD,
    so applying this step to an ANSI / Shift_JIS (CP932) file destroys the
    original text irreversibly. Measured with a CP932 file containing
@@ -141,23 +151,53 @@ with a BOM runs correctly under 5.1 — hence the exception.
    viewer's encoding, but the original bytes are gone either way):
 
    ```powershell
+   $candidateIdentity = Get-NormalizationCandidateIdentity `
+       -RepoRoot $repo `
+       -RelativePath $relativePath
+   if ([string]::IsNullOrEmpty([string]$candidateIdentity)) { return }
+   $path = [System.IO.Path]::Combine($repo, $relativePath)
    try {
-       # throwOnInvalidBytes=true: non-UTF-8 input (ANSI/Shift_JIS etc.) throws
-       # instead of silently corrupting. A leading BOM is stripped on read.
-       $t = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false, $true))
+       $originalBytes = [System.IO.File]::ReadAllBytes($path)
+       $originalDigest = Get-ByteDigest -Bytes $originalBytes
+       # Strip repeated leading BOMs, then use throwOnInvalidBytes=true.
+       $t = ConvertFrom-StrictUtf8Bytes -Bytes $originalBytes
    } catch [System.Text.DecoderFallbackException] {
        # This file is not UTF-8. Abort normalization for it and record the
        # decision as an open unknown in the report (no silent Shift_JIS->UTF-8
        # conversion). Continue with the other files.
        return
+   } catch {
+       # Other read failures can include the raw path in their exception text.
+       # Return without replaying that message; report a fixed safe reason.
+       return
    }
-   $t = $t.Replace("`r`n", "`n")
-   $t = ($t -split "`n" | ForEach-Object { $_.TrimEnd() }) -join "`n"
-   [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))  # no BOM
+   $t = ConvertTo-LfTrimmedText -Text $t  # CRLF and lone CR -> LF
+   $latestIdentity = Get-NormalizationCandidateIdentity `
+       -RepoRoot $repo `
+       -RelativePath $relativePath
+   try {
+       $latestDigest = Get-ByteDigest -Bytes (
+           [System.IO.File]::ReadAllBytes($path)
+       )
+   } catch { return }
+   if (-not [string]::Equals(
+           [string]$candidateIdentity,
+           [string]$latestIdentity,
+           [System.StringComparison]::Ordinal
+       ) -or -not [string]::Equals(
+           [string]$originalDigest,
+           [string]$latestDigest,
+           [System.StringComparison]::Ordinal
+       )) { return }
+   try {
+       [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))  # no BOM
+   } catch {
+       throw 'Normalization write failed; stop immediately and recover the guarded target before continuing.'
+   }
    ```
 
-5. For `.ps1` files that Windows PowerShell 5.1 executes, write with a BOM
-   instead:
+5. For `.ps1` files that Windows PowerShell 5.1 executes, use the BOM encoder
+   only at the final write inside the same double-checked block:
 
    ```powershell
    [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($true))
@@ -216,16 +256,35 @@ $out = $tpl.Replace('__NAME__', $value)
 
 Preconditions for normalization (steps 4–5) — check every box first:
 
-- [ ] The target file is under git control and can be restored with
-  `git diff` / `git checkout -- <file>`. Take a backup copy of untracked
-  files before touching them.
+- [ ] The explicit target exists as a regular blob in HEAD and has exactly one
+  stage-0 Git index entry with regular-file mode `100644` or `100755`. Skip
+  untracked, intent-to-add, conflicted, symlink (`120000`), and submodule
+  (`160000`) entries. Paths absent from HEAD—including typical staged
+  additions and new rename destinations—are rejected; an existing destination
+  is judged by its own HEAD/index identity because Git stores no general
+  rename bit.
+- [ ] Git routing/config/pathspec/trace environment variables are absent, and
+  `git rev-parse --show-toplevel` matches the requested repository root using
+  an ordinal comparison. Reject case-insensitive pathspec variables too.
+  Resolve Git as an application so an alias/function cannot forge output; the
+  selected PATH/application must still be trusted. Use `--no-lazy-fetch`, and
+  set `GIT_TRACE2`, `GIT_TRACE2_EVENT`, and `GIT_TRACE2_PERF` to `0` only
+  around the three synchronous identity queries, removing them in `finally`.
+  Use a dedicated, single-threaded PowerShell process; no other runspace,
+  thread, or child launch in that process may overlap the override window.
+- [ ] The target is lexically inside the repository, and the repository root,
+  every parent, and the leaf are ordinary non-reparse paths. Reject missing
+  paths, access failures, symlinks, and junctions. Recheck the path chain,
+  exact HEAD/index mode/OID/stage, and original raw-byte digest immediately
+  before the write.
 - [ ] The strict UTF-8 decode (`[System.Text.UTF8Encoding]::new($false,
   $true)`) completes without an exception. A file that fails is suspected
   ANSI / Shift_JIS: do not apply steps 4–5, do not convert its encoding as
-  a side effect — record it as an open unknown in the report.
-- [ ] The targets are text files you changed or added yourself. Do not
-  apply to binaries (images, executables), vendored code, or generated
-  artifacts such as `node_modules`.
+  a side effect — record it as an open unknown in the report. Strip every
+  repeated leading UTF-8 BOM and convert both CRLF and lone CR to LF.
+- [ ] The targets are existing HEAD-tracked text files you selected and
+  changed yourself. Do not apply to paths absent from HEAD, binaries (images,
+  executables), vendored code, or generated artifacts such as `node_modules`.
 - [ ] Before removing a BOM from any `.ps1`, confirm the script is never
   executed via Windows PowerShell 5.1 (hooks and Task Scheduler entries may
   run 5.1 even when your interactive shell is `pwsh` 7).
@@ -234,6 +293,18 @@ Preconditions for normalization (steps 4–5) — check every box first:
   produces huge diffs). When in doubt, do not bulk-convert: keep working
   file-by-file on the files you changed, and record the deferred decision
   as an open unknown (do not stop).
+- [ ] Run this portable pattern only in a trusted local checkout without a
+  concurrent adversary. The final digest-check/write window still has a small
+  race and cannot detect hard links or Unix mount substitution; closing those
+  gaps requires OS-specific no-follow handles and file-identity checks outside
+  this copy snippet.
+- [ ] Keep the raw path only for filesystem/Git APIs. Diagnostic labels must
+  escape BMP and supplementary control/format scalars, unpaired surrogates,
+  and Unicode line/paragraph separators before terminal output.
+- [ ] Treat a final `WriteAllText` exception as fatal, not as a skipped file:
+  it can fail after truncation. Stop, inspect the guarded target, and recover
+  it from a trusted backup, HEAD, or the index as appropriate before continuing;
+  emit only a fixed path-free error.
 - [ ] Do not machine-apply the control-character check of step 8 to files
   where TAB is syntactically required (Makefiles and similar). On a false
   positive, exclude the file and continue.
