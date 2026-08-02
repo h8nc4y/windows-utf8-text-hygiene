@@ -23,6 +23,24 @@ function Add-Failure {
     $failures.Add($Message) | Out-Null
 }
 
+function Read-StrictUtf8Text {
+    param(
+        [string]$FilePath,
+        [string]$Description
+    )
+
+    try {
+        # PS5.1のGet-Content既定encodingへ依存せず、BOMなし日本語docsも
+        # pwsh 7と同じbyte contractで読む。不正byteは置換せずfail closed。
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        return [System.IO.File]::ReadAllText($FilePath, $strictUtf8)
+    }
+    catch {
+        Add-Failure "$Description must be strict UTF-8."
+        return $null
+    }
+}
+
 function Get-RepoFilePath {
     param([string]$RelativePath)
     return Join-Path $root $RelativePath
@@ -50,7 +68,12 @@ function Assert-FileContains {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    $content = Read-StrictUtf8Text `
+        -FilePath $filePath `
+        -Description $RelativePath
+    if ($null -eq $content) {
+        return
+    }
     if ($content -notmatch $Pattern) {
         Add-Failure "$RelativePath is missing: $Description"
     }
@@ -70,7 +93,12 @@ function Assert-FilePatternCount {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    $content = Read-StrictUtf8Text `
+        -FilePath $filePath `
+        -Description $RelativePath
+    if ($null -eq $content) {
+        return
+    }
     $actualCount = [regex]::Matches($content, $Pattern).Count
     if ($actualCount -ne $ExpectedCount) {
         Add-Failure (
@@ -93,7 +121,12 @@ function Assert-FileDoesNotContain {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    $content = Read-StrictUtf8Text `
+        -FilePath $filePath `
+        -Description $RelativePath
+    if ($null -eq $content) {
+        return
+    }
     if ($content -match $Pattern) {
         Add-Failure "$RelativePath still contains: $Description"
     }
@@ -1432,151 +1465,428 @@ function Get-OrdinalFragmentCount {
     return $count
 }
 
-function Get-GuardedNormalizationExpectedEnumerationBlock {
-    # 公開exampleとvalidatorが同じcopy-adaptable blockを正本として共有できるよう、
-    # scalar化を防ぐ型宣言を含む最小の列挙phaseをexact textで固定する。
+function Get-GuardedNormalizationExpectedPatternCode {
+    # destructive example全体をexact oracleにする。安全helperのdecoy化、target sourceの
+    # 差替え、guard外sink追加を、部分的な文字列検査だけで見逃さないためである。
     return @'
-$raw = (git -C $repo status --porcelain=v1 -z) -join ''
-[string[]]$entries = @(
-    $raw -split "`0" | Where-Object { $_ }
-)
-$files = @()
-for ($i = 0; $i -lt $entries.Count; $i++) {
-    $status = $entries[$i].Substring(0, 2)
-    $path = $entries[$i].Substring(3)
-    if ($status -match 'R') { $i++; continue }   # rename: skip entry + its old-path token
-    if ($status -match 'D') { continue }         # deleted: nothing left to normalize
-    $files += Join-Path $repo $path
+$repo = [System.IO.Path]::GetFullPath('<repo>')
+
+function Test-GitRoutingEnvironmentClean {
+    # Routing/config/trace injection can redirect reads or append trace output
+    # outside the checkout. Reject caller trace state before applying bounded
+    # child-call Trace2 suppression below.
+    $blockedNames = @(
+        'GIT_DIR',
+        'GIT_WORK_TREE',
+        'GIT_COMMON_DIR',
+        'GIT_INDEX_FILE',
+        'GIT_OBJECT_DIRECTORY',
+        'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+        'GIT_CONFIG',
+        'GIT_CONFIG_COUNT',
+        'GIT_CONFIG_PARAMETERS',
+        'GIT_CONFIG_GLOBAL',
+        'GIT_CONFIG_SYSTEM',
+        'GIT_NAMESPACE',
+        'GIT_REPLACE_REF_BASE',
+        'GIT_SHALLOW_FILE',
+        'GIT_GRAFT_FILE',
+        'GIT_CEILING_DIRECTORIES',
+        'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+        'GIT_GLOB_PATHSPECS',
+        'GIT_NOGLOB_PATHSPECS',
+        'GIT_LITERAL_PATHSPECS',
+        'GIT_ICASE_PATHSPECS',
+        'GIT_NO_LAZY_FETCH'
+    )
+    foreach ($nameObject in [Environment]::GetEnvironmentVariables().Keys) {
+        $name = [string]$nameObject
+        if ($blockedNames -icontains $name -or
+            $name -like 'GIT_CONFIG_KEY_*' -or
+            $name -like 'GIT_CONFIG_VALUE_*' -or
+            $name -like 'GIT_TRACE*') {
+            return $false
+        }
+    }
+    return $true
 }
-$files = $files | Where-Object { $_ -match '\.(md|txt|yml|yaml|json|py|js|ts)$' }
+
+function Get-NormalizedRootPath {
+    param([string]$Path)
+
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $volumeRoot = [System.IO.Path]::GetPathRoot($full)
+        if ($full.Length -le $volumeRoot.Length) { return $full }
+        return $full.TrimEnd([char[]]@(
+                [System.IO.Path]::DirectorySeparatorChar,
+                [System.IO.Path]::AltDirectorySeparatorChar
+            ))
+    } catch {
+        return $null
+    }
+}
+
+function Get-GitRegularMetadata {
+    param(
+        [string]$Raw,
+        [ValidateSet('Index', 'Head')]
+        [string]$Kind
+    )
+
+    [string[]]$records = @(
+        $Raw.Split(
+            [char[]]@([char]0),
+            [System.StringSplitOptions]::RemoveEmptyEntries
+        )
+    )
+    if ($records.Count -ne 1) { return $null }
+    $tabIndex = $records[0].IndexOf("`t")
+    if ($tabIndex -lt 0) { return $null }
+    $metadata = $records[0].Substring(0, $tabIndex)
+    [string[]]$fields = @(
+        $metadata.Split(
+            [char[]]@(' '),
+            [System.StringSplitOptions]::RemoveEmptyEntries
+        )
+    )
+    if ($Kind -eq 'Index') {
+        if ($fields.Count -ne 3 -or $fields[2] -ne '0' -or
+            $fields[0] -notin @('100644', '100755')) {
+            return $null
+        }
+    } else {
+        if ($fields.Count -ne 3 -or $fields[1] -cne 'blob' -or
+            $fields[0] -notin @('100644', '100755')) {
+            return $null
+        }
+    }
+    return $metadata
+}
+
+function Get-GitTrackedRegularFileIdentity {
+    param(
+        [string]$RepoRoot,
+        [string]$RelativePath
+    )
+
+    if (-not (Test-GitRoutingEnvironmentClean)) { return $null }
+    $rootBoundary = Get-NormalizedRootPath -Path $RepoRoot
+    if ([string]::IsNullOrEmpty([string]$rootBoundary)) { return $null }
+
+    # Resolve only an application, so a caller-defined alias/function named
+    # `git` cannot forge identity output. The host PATH remains a trust input.
+    $gitApplications = @(
+        Microsoft.PowerShell.Core\Get-Command `
+            -Name git `
+            -CommandType Application `
+            -ErrorAction SilentlyContinue
+    )
+    if ($gitApplications.Count -lt 1) { return $null }
+    $gitExecutable = $gitApplications[0].Source
+    if ([string]::IsNullOrEmpty([string]$gitExecutable)) { return $null }
+
+    # Trace2 targets from system/global config can append to an absolute path
+    # or contact an AF_UNIX socket. Git ignores `-c trace2.*Target=0` for these
+    # settings, so override only the three documented child-process variables
+    # and remove them in finally. Caller-provided GIT_TRACE* is rejected above.
+    $trace2OverrideNames = @('GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')
+    try {
+        foreach ($traceName in $trace2OverrideNames) {
+            [Environment]::SetEnvironmentVariable($traceName, '0', 'Process')
+        }
+        # Bind `-C` to the exact requested top level. Ordinal comparison is
+        # deliberately fail closed on case-sensitive Windows directories too.
+        $topLevelOutput = @(
+            & $gitExecutable --no-replace-objects --no-lazy-fetch -C $rootBoundary rev-parse --show-toplevel 2>$null
+        )
+        if ($LASTEXITCODE -ne 0 -or $topLevelOutput.Count -ne 1) { return $null }
+        $actualTopLevel = Get-NormalizedRootPath -Path $topLevelOutput[0]
+        if (-not [string]::Equals(
+                $rootBoundary,
+                $actualTopLevel,
+                [System.StringComparison]::Ordinal
+            )) { return $null }
+
+        # The literal pathspec prevents wildcard/pathspec-magic expansion. A
+        # regular stage-0 index entry is necessary, and the same path must also
+        # be a regular blob in HEAD. The HEAD requirement rejects untracked,
+        # intent-to-add, paths absent from HEAD (including typical staged additions
+        # and new rename destinations), symlinks, and submodules.
+        $literalPathSpec = ':(literal)' + $RelativePath
+        $rawIndex = (
+            & $gitExecutable --no-replace-objects --no-lazy-fetch -C $rootBoundary `
+                ls-files --stage -z -- $literalPathSpec 2>$null
+        ) -join ''
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $indexMetadata = Get-GitRegularMetadata -Raw $rawIndex -Kind 'Index'
+        if ([string]::IsNullOrEmpty([string]$indexMetadata)) { return $null }
+
+        $rawHead = (
+            & $gitExecutable --no-replace-objects --no-lazy-fetch -C $rootBoundary `
+                ls-tree -z HEAD -- $literalPathSpec 2>$null
+        ) -join ''
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $headMetadata = Get-GitRegularMetadata -Raw $rawHead -Kind 'Head'
+        if ([string]::IsNullOrEmpty([string]$headMetadata)) { return $null }
+        return "index=$indexMetadata;head=$headMetadata"
+    } finally {
+        foreach ($traceName in $trace2OverrideNames) {
+            Microsoft.PowerShell.Management\Remove-Item `
+                -LiteralPath "Env:$traceName" `
+                -ErrorAction Stop
+        }
+    }
+}
+
+function Test-RepositoryRegularFileBoundary {
+    param(
+        [string]$RepoRoot,
+        [string]$RelativePath
+    )
+
+    if ([System.IO.Path]::IsPathRooted($RelativePath)) {
+        return $false
+    }
+    try {
+        $comparison = [System.StringComparison]::Ordinal
+        $rootBoundary = Get-NormalizedRootPath -Path $RepoRoot
+        if ([string]::IsNullOrEmpty([string]$rootBoundary)) { return $false }
+        $candidateFull = [System.IO.Path]::GetFullPath(
+            [System.IO.Path]::Combine($rootBoundary, $RelativePath)
+        )
+    } catch {
+        return $false
+    }
+
+    # Lexical containment comes first. The component walk below then rejects
+    # every symlink/junction from the candidate through the repository root,
+    # so the lexical path cannot resolve through a reparse point to outside.
+    $rootPrefix = $rootBoundary
+    if (-not $rootPrefix.EndsWith(
+            [string][System.IO.Path]::DirectorySeparatorChar,
+            [System.StringComparison]::Ordinal
+        )) {
+        $rootPrefix += [System.IO.Path]::DirectorySeparatorChar
+    }
+    if (-not $candidateFull.StartsWith($rootPrefix, $comparison)) {
+        return $false
+    }
+
+    $current = $candidateFull
+    $isCandidate = $true
+    while ($true) {
+        try {
+            $attributes = [System.IO.File]::GetAttributes($current)
+        } catch {
+            return $false
+        }
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        if ($isCandidate) {
+            if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                return $false
+            }
+            $isCandidate = $false
+        } elseif (($attributes -band [System.IO.FileAttributes]::Directory) -eq 0) {
+            return $false
+        }
+        if ([string]::Equals($current, $rootBoundary, $comparison)) {
+            break
+        }
+        $parent = [System.IO.Directory]::GetParent($current)
+        if ($null -eq $parent) { return $false }
+        $current = $parent.FullName
+    }
+
+    return [System.IO.File]::Exists($candidateFull)
+}
+
+function Get-NormalizationCandidateIdentity {
+    param(
+        [string]$RepoRoot,
+        [string]$RelativePath
+    )
+
+    if (-not (Test-RepositoryRegularFileBoundary `
+            -RepoRoot $RepoRoot `
+            -RelativePath $RelativePath)) {
+        return $null
+    }
+    return Get-GitTrackedRegularFileIdentity `
+        -RepoRoot $RepoRoot `
+        -RelativePath $RelativePath
+}
+
+function Get-ByteDigest {
+    param([byte[]]$Bytes)
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [Convert]::ToBase64String($sha256.ComputeHash($Bytes))
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function ConvertFrom-StrictUtf8Bytes {
+    param([byte[]]$Bytes)
+
+    # Strip every leading UTF-8 BOM sequence. Removing only the first would
+    # decode a doubled BOM as U+FEFF and silently write one BOM back.
+    $bomLength = 0
+    while ($Bytes.Length - $bomLength -ge 3 -and
+        $Bytes[$bomLength] -eq 0xEF -and
+        $Bytes[$bomLength + 1] -eq 0xBB -and
+        $Bytes[$bomLength + 2] -eq 0xBF) {
+        $bomLength += 3
+    }
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    return $strictUtf8.GetString(
+        $Bytes,
+        $bomLength,
+        $Bytes.Length - $bomLength
+    )
+}
+
+function ConvertTo-LfTrimmedText {
+    param([AllowEmptyString()][string]$Text)
+
+    # Normalize CRLF first, then any remaining lone CR. Preserve whether the
+    # final logical line is empty while trimming trailing whitespace per line.
+    $normalized = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    [string[]]$lines = @($normalized -split "`n")
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $lines[$index] = $lines[$index].TrimEnd()
+    }
+    return $lines -join "`n"
+}
+
+function ConvertTo-SafePathLabel {
+    param([string]$RelativePath)
+
+    $builder = [System.Text.StringBuilder]::new()
+    $index = 0
+    while ($index -lt $RelativePath.Length) {
+        $category = [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory(
+            $RelativePath,
+            $index
+        )
+        $scalarLength = 1
+        $codePoint = [int]$RelativePath[$index]
+        if ([char]::IsHighSurrogate($RelativePath[$index]) -and
+            $index + 1 -lt $RelativePath.Length -and
+            [char]::IsLowSurrogate($RelativePath[$index + 1])) {
+            $scalarLength = 2
+            $codePoint = [char]::ConvertToUtf32(
+                $RelativePath[$index],
+                $RelativePath[$index + 1]
+            )
+        }
+        if ($category -in @(
+                [System.Globalization.UnicodeCategory]::Control,
+                [System.Globalization.UnicodeCategory]::Format,
+                [System.Globalization.UnicodeCategory]::Surrogate,
+                [System.Globalization.UnicodeCategory]::LineSeparator,
+                [System.Globalization.UnicodeCategory]::ParagraphSeparator
+            )) {
+            if ($codePoint -le 0xFFFF) {
+                [void]$builder.AppendFormat('\u{0:X4}', $codePoint)
+            } else {
+                [void]$builder.AppendFormat('\U{0:X8}', $codePoint)
+            }
+        } else {
+            [void]$builder.Append($RelativePath.Substring($index, $scalarLength))
+        }
+        if ($builder.Length -ge 160) {
+            [void]$builder.Append('...')
+            break
+        }
+        $index += $scalarLength
+    }
+    return $builder.ToString()
+}
+
+# List only existing, HEAD-tracked files you selected for this change. Do not
+# populate this list by capturing native `git ... -z` output as PowerShell
+# text: embedded CR/LF bytes in a valid POSIX filename are lost by that path.
+[string[]]$relativePaths = @(
+    '<repo-relative-file.md>'
+)
+
+$skipped = @()
+foreach ($relativePath in $relativePaths) {
+    $safeLabel = ConvertTo-SafePathLabel -RelativePath $relativePath
+    # Recheck Git identity and every path component immediately before read.
+    $candidateIdentity = Get-NormalizationCandidateIdentity `
+        -RepoRoot $repo `
+        -RelativePath $relativePath
+    if ([string]::IsNullOrEmpty([string]$candidateIdentity)) {
+        $skipped += "$safeLabel (unsafe path, Git environment, or identity)"
+        continue
+    }
+    $path = [System.IO.Path]::Combine($repo, $relativePath)
+    try {
+        $originalBytes = [System.IO.File]::ReadAllBytes($path)
+        $originalDigest = Get-ByteDigest -Bytes $originalBytes
+        $t = ConvertFrom-StrictUtf8Bytes -Bytes $originalBytes
+    } catch [System.Text.DecoderFallbackException] {
+        # Not UTF-8 (suspected ANSI/Shift_JIS). Do not touch; do not
+        # convert; record for the report and continue with other files.
+        $skipped += "$safeLabel (strict decode failed)"
+        continue
+    } catch {
+        $skipped += "$safeLabel (read or digest failed)"
+        continue
+    }
+    $t = ConvertTo-LfTrimmedText -Text $t
+
+    # The path can change after the read. Reacquire the same boundary
+    # immediately before the destructive write and fail closed on drift.
+    $latestIdentity = Get-NormalizationCandidateIdentity `
+        -RepoRoot $repo `
+        -RelativePath $relativePath
+    try {
+        $latestDigest = Get-ByteDigest -Bytes (
+            [System.IO.File]::ReadAllBytes($path)
+        )
+    } catch {
+        $latestDigest = $null
+    }
+    if (-not [string]::Equals(
+            [string]$candidateIdentity,
+            [string]$latestIdentity,
+            [System.StringComparison]::Ordinal
+        ) -or
+        -not [string]::Equals(
+            [string]$originalDigest,
+            [string]$latestDigest,
+            [System.StringComparison]::Ordinal
+        )) {
+        $skipped += "$safeLabel (path, Git identity, or bytes changed before write)"
+        continue
+    }
+    try {
+        [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))  # no BOM
+    } catch {
+        # WriteAllText can fail after truncation. Stop immediately with fixed
+        # text so possible partial content is never mislabeled as a safe skip.
+        throw 'Normalization write failed; stop immediately and recover the guarded target before continuing.'
+    }
+}
+if ($skipped.Count -gt 0) {
+    "Skipped (unsafe boundary, drift, read failure, or strict decode failure):"
+    $skipped
+}
 '@
 }
 
-function Get-GuardedNormalizationCandidatePaths {
-    param(
-        [string]$RepoPath,
-        [AllowEmptyString()]
-        [string]$Raw
-    )
-
-    # NUL splitが0件・1件でも必ずstring arrayを作る。PowerShell pipelineは
-    # 1件だけをscalarへ展開するため、@(...)を外すとindexがcharを返してしまう。
-    [string[]]$entries = @(
-        $Raw -split "`0" | Where-Object { $_ }
-    )
-    $files = @()
-    for ($index = 0; $index -lt $entries.Count; $index++) {
-        $status = $entries[$index].Substring(0, 2)
-        $path = $entries[$index].Substring(3)
-
-        # porcelain -zのrenameは新path recordの直後に旧path tokenが続く。
-        # 両方を正規化対象から外し、旧pathをstatus recordとして再解釈しない。
-        if ($status -match 'R') {
-            $index++
-            continue
-        }
-        if ($status -match 'D') {
-            continue
-        }
-        $files += Join-Path $RepoPath $path
-    }
-
-    return @(
-        $files |
-            Where-Object {
-                $_ -match '\.(md|txt|yml|yaml|json|py|js|ts)$'
-            }
-    )
-}
-
-function Test-StringSequenceExact {
-    param(
-        [object[]]$Actual,
-        [object[]]$Expected
-    )
-
-    $actualValues = @($Actual)
-    $expectedValues = @($Expected)
-    if ($actualValues.Count -ne $expectedValues.Count) {
-        return $false
-    }
-    for ($index = 0; $index -lt $expectedValues.Count; $index++) {
-        if (-not [string]::Equals(
-                [string]$actualValues[$index],
-                [string]$expectedValues[$index],
-                [System.StringComparison]::Ordinal
-            )) {
-            return $false
-        }
-    }
-    return $true
-}
-
-function Test-GuardedNormalizationPorcelainSemantics {
-    param([scriptblock]$Parser)
-
-    $syntheticRepo = 'synthetic-root'
-    $japaneseName = '日本語 file.md'
-    $spaceName = 'space name.txt'
-    $keepName = 'keep.json'
-    $fixtures = @(
-        [pscustomobject]@{
-            Name = 'zero records'
-            Raw = ''
-            Expected = @()
-        },
-        [pscustomobject]@{
-            Name = 'one Japanese and space-bearing record'
-            Raw = " M $japaneseName`0"
-            Expected = @(
-                Join-Path $syntheticRepo $japaneseName
-            )
-        },
-        [pscustomobject]@{
-            Name = 'multiple records'
-            Raw = " M $japaneseName`0A  $spaceName`0"
-            Expected = @(
-                Join-Path $syntheticRepo $japaneseName
-                Join-Path $syntheticRepo $spaceName
-            )
-        },
-        [pscustomobject]@{
-            Name = 'rename pair and deletion'
-            Raw = "R  renamed.md`0old.md`0 D deleted.txt`0"
-            Expected = @()
-        },
-        [pscustomobject]@{
-            Name = 'kept record around skipped records'
-            Raw = "R  renamed.md`0old.md`0 M $keepName`0 D deleted.txt`0"
-            Expected = @(
-                Join-Path $syntheticRepo $keepName
-            )
-        }
-    )
-
-    foreach ($fixture in $fixtures) {
-        try {
-            $actual = @(
-                & $Parser $syntheticRepo ([string]$fixture.Raw)
-            )
-        }
-        catch {
-            return $false
-        }
-        if (-not (Test-StringSequenceExact `
-                -Actual $actual `
-                -Expected @($fixture.Expected))) {
-            return $false
-        }
-    }
-    return $true
-}
-
-function Test-GuardedNormalizationExampleContract {
+function Get-GuardedNormalizationPatternCode {
     param([string]$Source)
 
     if ([string]::IsNullOrWhiteSpace($Source)) {
-        return $false
+        return $null
     }
     $normalizedSource = $Source.Replace("`r`n", "`n")
     $sectionMarker = '## The pattern' + "`n"
@@ -1585,7 +1895,7 @@ function Test-GuardedNormalizationExampleContract {
         [System.StringComparison]::Ordinal
     )
     if ($sectionStart -lt 0) {
-        return $false
+        return $null
     }
     $sectionEnd = $normalizedSource.IndexOf(
         "`n## ",
@@ -1593,20 +1903,17 @@ function Test-GuardedNormalizationExampleContract {
         [System.StringComparison]::Ordinal
     )
     if ($sectionEnd -lt 0) {
-        return $false
+        return $null
     }
     $section = $normalizedSource.Substring(
         $sectionStart,
         $sectionEnd - $sectionStart
     )
 
-    # exact blockをThe pattern内の唯一のPowerShell fenceへ閉じ込める。
-    # 別sectionへ正しいdecoyを置き、実行例だけ弱める形も拒否する。
+    # 実行例をThe pattern内の唯一のPowerShell fenceへ閉じ込める。
     $fenceMarker = '```powershell' + "`n"
-    if ((Get-OrdinalFragmentCount `
-            -Content $section `
-            -Fragment $fenceMarker) -ne 1) {
-        return $false
+    if ((Get-OrdinalFragmentCount -Content $section -Fragment $fenceMarker) -ne 1) {
+        return $null
     }
     $fenceStart = $section.IndexOf(
         $fenceMarker,
@@ -1619,28 +1926,2355 @@ function Test-GuardedNormalizationExampleContract {
         [System.StringComparison]::Ordinal
     )
     if ($fenceStart -lt 0 -or $fenceEnd -lt 0) {
+        return $null
+    }
+    return $section.Substring($codeStart, $fenceEnd - $codeStart)
+}
+
+function Test-GuardedNormalizationPatternAstSafety {
+    param([string]$FencedCode)
+
+    if ([string]::IsNullOrWhiteSpace($FencedCode)) {
         return $false
     }
-    $fencedCode = $section.Substring(
-        $codeStart,
-        $fenceEnd - $codeStart
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $FencedCode,
+        [ref]$tokens,
+        [ref]$parseErrors
     )
-    $expectedBlock = Get-GuardedNormalizationExpectedEnumerationBlock
-    if ((Get-OrdinalFragmentCount `
-            -Content $normalizedSource `
-            -Fragment $expectedBlock) -ne 1 -or
-        (Get-OrdinalFragmentCount `
-            -Content $fencedCode `
-            -Fragment $expectedBlock) -ne 1 -or
-        (Get-OrdinalFragmentCount `
-            -Content $fencedCode `
-            -Fragment '$raw = (git -C $repo status --porcelain=v1 -z)') -ne 1 -or
-        (Get-OrdinalFragmentCount `
-            -Content $fencedCode `
-            -Fragment '$entries =') -ne 1) {
+    if (@($parseErrors).Count -ne 0) {
+        return $false
+    }
+
+    # using/#requires/advanced-function blocksはEndBlock inventoryの外でmodule
+    # import等を起動できる。PS5.1共通propertyだけでroot envelopeを閉じる。
+    $cleanBlockProperty = $ast.PSObject.Properties['CleanBlock']
+    if ($ast.Attributes.Count -ne 0 -or
+        $ast.UsingStatements.Count -ne 0 -or
+        $null -ne $ast.ScriptRequirements -or
+        $null -ne $ast.ParamBlock -or
+        $null -ne $ast.DynamicParamBlock -or
+        $null -ne $ast.BeginBlock -or
+        $null -ne $ast.ProcessBlock -or
+        $null -eq $ast.EndBlock -or
+        ($null -ne $cleanBlockProperty -and
+            $null -ne $cleanBlockProperty.Value) -or
+        -not $ast.EndBlock.Unnamed) {
+        return $false
+    }
+
+    # Script scopeのtrap等はfixed fatalを横取りできるため、top-level inventoryを
+    # exact化し、nestedを含むTrapStatementAstも明示的に0件へ固定する。
+    $topLevelStatements = @($ast.EndBlock.Statements)
+    [string[]]$expectedTopLevelTypes = @(
+        'AssignmentStatementAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'FunctionDefinitionAst',
+        'AssignmentStatementAst',
+        'AssignmentStatementAst',
+        'ForEachStatementAst',
+        'IfStatementAst'
+    )
+    if ($topLevelStatements.Count -ne $expectedTopLevelTypes.Count -or
+        @(
+            $ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.TrapStatementAst]
+                }, $true)
+        ).Count -ne 0) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedTopLevelTypes.Count; $index++) {
+        if ($topLevelStatements[$index].GetType().Name -cne
+            $expectedTopLevelTypes[$index]) {
+            return $false
+        }
+    }
+    [string[]]$expectedTopLevelFunctionOrder = @(
+        'Test-GitRoutingEnvironmentClean',
+        'Get-NormalizedRootPath',
+        'Get-GitRegularMetadata',
+        'Get-GitTrackedRegularFileIdentity',
+        'Test-RepositoryRegularFileBoundary',
+        'Get-NormalizationCandidateIdentity',
+        'Get-ByteDigest',
+        'ConvertFrom-StrictUtf8Bytes',
+        'ConvertTo-LfTrimmedText',
+        'ConvertTo-SafePathLabel'
+    )
+    for ($index = 0; $index -lt $expectedTopLevelFunctionOrder.Count; $index++) {
+        if ($topLevelStatements[$index + 1].Name -cne
+            $expectedTopLevelFunctionOrder[$index]) {
+            return $false
+        }
+    }
+    $finalDiagnosticOutput = $topLevelStatements[14]
+    if ($finalDiagnosticOutput.Clauses.Count -ne 1 -or
+        $null -ne $finalDiagnosticOutput.ElseClause -or
+        $finalDiagnosticOutput.Clauses[0].Item1.Extent.Text -cne
+            '$skipped.Count -gt 0' -or
+        $finalDiagnosticOutput.Clauses[0].Item2.Statements.Count -ne 2 -or
+        $finalDiagnosticOutput.Clauses[0].Item2.Statements[0].Extent.Text -cne
+            '"Skipped (unsafe boundary, drift, read failure, or strict decode failure):"' -or
+        $finalDiagnosticOutput.Clauses[0].Item2.Statements[1].Extent.Text -cne
+            '$skipped') {
+        return $false
+    }
+
+    # denylistでは別名・short type・新しいsinkを取りこぼす。command、member、
+    # resolved typeをcanonical例のexact allowlistへ閉じ、追加ASTをすべて拒否する。
+    [string[]]$expectedNamedCommands = @(
+        'ConvertFrom-StrictUtf8Bytes',
+        'ConvertTo-LfTrimmedText',
+        'ConvertTo-SafePathLabel',
+        'Get-ByteDigest',
+        'Get-ByteDigest',
+        'Get-GitRegularMetadata',
+        'Get-GitRegularMetadata',
+        'Get-GitTrackedRegularFileIdentity',
+        'Get-NormalizationCandidateIdentity',
+        'Get-NormalizationCandidateIdentity',
+        'Get-NormalizedRootPath',
+        'Get-NormalizedRootPath',
+        'Get-NormalizedRootPath',
+        'Microsoft.PowerShell.Core\Get-Command',
+        'Microsoft.PowerShell.Management\Remove-Item',
+        'Test-GitRoutingEnvironmentClean',
+        'Test-RepositoryRegularFileBoundary'
+    )
+    [Array]::Sort($expectedNamedCommands, [System.StringComparer]::Ordinal)
+    $commandAsts = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst]
+            }, $true)
+    )
+    $actualNamedCommands = [System.Collections.Generic.List[string]]::new()
+    $dynamicGitCommandShapes = [System.Collections.Generic.List[string]]::new()
+    $dynamicGitCommandCount = 0
+    foreach ($commandAst in $commandAsts) {
+        $commandName = $commandAst.GetCommandName()
+        if ([string]::IsNullOrEmpty([string]$commandName)) {
+            if ($commandAst.InvocationOperator -ne
+                    [System.Management.Automation.Language.TokenKind]::Ampersand -or
+                $commandAst.CommandElements.Count -lt 1 -or
+                $commandAst.CommandElements[0].Extent.Text -cne '$gitExecutable') {
+                return $false
+            }
+            $dynamicGitCommandCount++
+            $dynamicGitCommandShapes.Add((@(
+                        $commandAst.CommandElements |
+                            ForEach-Object { $_.Extent.Text }
+                    ) -join '|'))
+        } else {
+            $actualNamedCommands.Add($commandName)
+        }
+    }
+    if ($dynamicGitCommandCount -ne 3) {
+        return $false
+    }
+    [string[]]$expectedDynamicGitCommandShapes = @(
+        '$gitExecutable|--no-replace-objects|--no-lazy-fetch|-C|$rootBoundary|ls-files|--stage|-z|--|$literalPathSpec',
+        '$gitExecutable|--no-replace-objects|--no-lazy-fetch|-C|$rootBoundary|ls-tree|-z|HEAD|--|$literalPathSpec',
+        '$gitExecutable|--no-replace-objects|--no-lazy-fetch|-C|$rootBoundary|rev-parse|--show-toplevel'
+    )
+    [Array]::Sort($expectedDynamicGitCommandShapes, [System.StringComparer]::Ordinal)
+    [string[]]$actualDynamicGitCommandShapeArray = @($dynamicGitCommandShapes)
+    [Array]::Sort($actualDynamicGitCommandShapeArray, [System.StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $expectedDynamicGitCommandShapes.Count; $index++) {
+        if ($actualDynamicGitCommandShapeArray[$index] -cne
+            $expectedDynamicGitCommandShapes[$index]) {
+            return $false
+        }
+    }
+
+    # Trace2 suppression must dominate every dynamic Git query, and cleanup
+    # must be the sole finally statement. Exact command counts aloneでは、
+    # safe setupをquery後へ移すcontrol-flow driftを検出できない。
+    $identityFunctions = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq 'Get-GitTrackedRegularFileIdentity'
+            }, $true)
+    )
+    if ($identityFunctions.Count -ne 1) {
+        return $false
+    }
+    $identityStatements = @($identityFunctions[0].Body.EndBlock.Statements)
+    [string[]]$expectedIdentityStatementTypes = @(
+        'IfStatementAst',
+        'AssignmentStatementAst',
+        'IfStatementAst',
+        'AssignmentStatementAst',
+        'IfStatementAst',
+        'AssignmentStatementAst',
+        'IfStatementAst',
+        'AssignmentStatementAst',
+        'TryStatementAst'
+    )
+    if ($identityStatements.Count -ne $expectedIdentityStatementTypes.Count -or
+        $identityStatements[0].Extent.Text -cne
+            'if (-not (Test-GitRoutingEnvironmentClean)) { return $null }') {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedIdentityStatementTypes.Count; $index++) {
+        if ($identityStatements[$index].GetType().Name -cne
+            $expectedIdentityStatementTypes[$index]) {
+            return $false
+        }
+    }
+    $traceTry = $identityStatements[8]
+    if ($traceTry.CatchClauses.Count -ne 0 -or $null -eq $traceTry.Finally -or
+        $traceTry.Body.Statements.Count -ne 15 -or
+        $traceTry.Finally.Statements.Count -ne 1 -or
+        $traceTry.Body.Statements[0] -isnot
+            [System.Management.Automation.Language.ForEachStatementAst] -or
+        $traceTry.Finally.Statements[0] -isnot
+            [System.Management.Automation.Language.ForEachStatementAst]) {
+        return $false
+    }
+    $traceSetLoop = $traceTry.Body.Statements[0]
+    $traceCleanupLoop = $traceTry.Finally.Statements[0]
+    foreach ($traceLoop in @($traceSetLoop, $traceCleanupLoop)) {
+        if ($traceLoop.Variable.Extent.Text -cne '$traceName' -or
+            $traceLoop.Condition.Extent.Text -cne '$trace2OverrideNames') {
+            return $false
+        }
+    }
+    # foreach bodyを単一のdirect statementへ固定する。子孫に正しいcallがあっても、
+    # その前のcontinue/returnや常偽分岐で到達不能ならTrace2抑止にならない。
+    if ($traceSetLoop.Body.Statements.Count -ne 1 -or
+        $traceSetLoop.Body.Statements[0].Extent.Text -cne
+            "[Environment]::SetEnvironmentVariable(`$traceName, '0', 'Process')" -or
+        $traceCleanupLoop.Body.Statements.Count -ne 1) {
+        return $false
+    }
+    $traceSetLoopMembers = @(
+        $traceSetLoop.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    $node.Expression.Extent.Text -ceq '[Environment]' -and
+                    $node.Member.Extent.Text -ceq 'SetEnvironmentVariable'
+            }, $true)
+    )
+    $traceCleanupCommands = @(
+        $traceCleanupLoop.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -ceq
+                        'Microsoft.PowerShell.Management\Remove-Item'
+            }, $true)
+    )
+    if ($traceSetLoopMembers.Count -ne 1 -or $traceCleanupCommands.Count -ne 1) {
+        return $false
+    }
+    foreach ($dynamicGitCommand in @(
+            $commandAsts | Where-Object {
+                [string]::IsNullOrEmpty([string]$_.GetCommandName())
+            }
+        )) {
+        $ancestor = $dynamicGitCommand.Parent
+        while ($null -ne $ancestor -and
+            -not [object]::ReferenceEquals($ancestor, $traceTry.Body)) {
+            $ancestor = $ancestor.Parent
+        }
+        if ($null -eq $ancestor -or
+            $dynamicGitCommand.Extent.StartOffset -le
+                $traceSetLoop.Extent.EndOffset -or
+            $dynamicGitCommand.Extent.EndOffset -ge
+                $traceCleanupLoop.Extent.StartOffset) {
+            return $false
+        }
+    }
+    [string[]]$actualNamedCommandArray = @($actualNamedCommands)
+    [Array]::Sort($actualNamedCommandArray, [System.StringComparer]::Ordinal)
+    if ($actualNamedCommandArray.Count -ne $expectedNamedCommands.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedNamedCommands.Count; $index++) {
+        if ($actualNamedCommandArray[$index] -cne $expectedNamedCommands[$index]) {
+            return $false
+        }
+    }
+    # Named commandもname/countだけでなく全argument shapeをdigest固定する。
+    # RelativePath等を別literalへ差し替えてpath guardとactual writeを分離させない。
+    [string[]]$expectedNamedCommandSignatures = @(
+        'ConvertFrom-StrictUtf8Bytes|fG6RE4+ATmPI/tmz3kjbqCS2rDr/7PJ1p3A237dq850=',
+        'ConvertTo-LfTrimmedText|qKYCCxvpwTstqY8SVZgHQ6iYkQEC8pjsKMQyczNTVIM=',
+        'ConvertTo-SafePathLabel|lpNYesc1DST1EcDX600j/pZ3kdYRPdkR04x9fYqytl0=',
+        'Get-ByteDigest|ikGkSdLSsfVdSuSjg4sSZcgEHdxceOOOsMJ/SqlAxR8=',
+        'Get-ByteDigest|t0lpmATRNW/WNFgRUDvld3ponyal6IyYMbXgNMQ8mME=',
+        'Get-GitRegularMetadata|b22Zs+4KO/cN04U55K1I3O/BJetudIpzYoS0j9t+5AE=',
+        'Get-GitRegularMetadata|J8bnqigQ8tnoJIyzbr4r/na7pL+363ho8ujXZIwR8d8=',
+        'Get-GitTrackedRegularFileIdentity|hPj5h6OZ+lGjyNc7fgLRwDNUDpmLFwPmMFbQpfuo5OQ=',
+        'Get-NormalizationCandidateIdentity|dTua/HYLDt3tB/+1/qeQGzttsa7PnWGKnSoUPRmuDgY=',
+        'Get-NormalizationCandidateIdentity|dTua/HYLDt3tB/+1/qeQGzttsa7PnWGKnSoUPRmuDgY=',
+        'Get-NormalizedRootPath|D0s2q7o/RFnbbbwmP/yN6dZ3UPy4VKy/wlBi8kK05Ko=',
+        'Get-NormalizedRootPath|ISq4DN8tJOq/FmDQd2aQ9429lUeCrY1VlK8E5rrURBE=',
+        'Get-NormalizedRootPath|ISq4DN8tJOq/FmDQd2aQ9429lUeCrY1VlK8E5rrURBE=',
+        'Microsoft.PowerShell.Core\Get-Command|6gUiT6yOjpAn4TAb23grGHiIkhHhVuHepNhz8QKNuvE=',
+        'Microsoft.PowerShell.Management\Remove-Item|ic6Q8WESYv9PE6vihYfWo9TqzB0iHc6NhcZAUu/4UwQ=',
+        'Test-GitRoutingEnvironmentClean|k2ZYm6fsZ5QS8g85ITQJNXcb1ACLPFf0bBnmqnHpTNM=',
+        'Test-RepositoryRegularFileBoundary|AD/A41/Eu/aWmqGnfFLe1i5OaFdQs1dcqq7M78NwCFM='
+    )
+    $namedCommandHasher = [System.Security.Cryptography.SHA256]::Create()
+    $namedCommandUtf8 = [System.Text.UTF8Encoding]::new($false)
+    $actualNamedCommandSignatures = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($namedCommandAst in @(
+                $commandAsts | Where-Object {
+                    -not [string]::IsNullOrEmpty([string]$_.GetCommandName())
+                }
+            )) {
+            $namedCommandShape = @(
+                $namedCommandAst.CommandElements |
+                    ForEach-Object { $_.Extent.Text }
+            ) -join '|'
+            $namedCommandDigest = [Convert]::ToBase64String(
+                $namedCommandHasher.ComputeHash(
+                    $namedCommandUtf8.GetBytes($namedCommandShape)
+                )
+            )
+            $actualNamedCommandSignatures.Add(
+                $namedCommandAst.GetCommandName() + '|' + $namedCommandDigest
+            )
+        }
+    }
+    finally {
+        $namedCommandHasher.Dispose()
+    }
+    [Array]::Sort($expectedNamedCommandSignatures, [System.StringComparer]::Ordinal)
+    [string[]]$actualNamedCommandSignatureArray = @($actualNamedCommandSignatures)
+    [Array]::Sort($actualNamedCommandSignatureArray, [System.StringComparer]::Ordinal)
+    if ($actualNamedCommandSignatureArray.Count -ne
+        $expectedNamedCommandSignatures.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedNamedCommandSignatures.Count; $index++) {
+        if ($actualNamedCommandSignatureArray[$index] -cne
+            $expectedNamedCommandSignatures[$index]) {
+            return $false
+        }
+    }
+
+    # Candidate helperのdirect control flowを2 statementsへ固定し、early-return
+    # decoyでboundary/Git identity callをunreachableにする同期変更を拒否する。
+    $candidateFunctions = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq 'Get-NormalizationCandidateIdentity'
+            }, $true)
+    )
+    $expectedCandidateBoundaryStatement = @'
+if (-not (Test-RepositoryRegularFileBoundary `
+            -RepoRoot $RepoRoot `
+            -RelativePath $RelativePath)) {
+        return $null
+    }
+'@
+    $expectedCandidateIdentityStatement = @'
+return Get-GitTrackedRegularFileIdentity `
+        -RepoRoot $RepoRoot `
+        -RelativePath $RelativePath
+'@
+    if ($candidateFunctions.Count -ne 1 -or
+        $candidateFunctions[0].Body.EndBlock.Statements.Count -ne 2 -or
+        $candidateFunctions[0].Body.EndBlock.Statements[0].Extent.Text -cne
+            $expectedCandidateBoundaryStatement -or
+        $candidateFunctions[0].Body.EndBlock.Statements[1].Extent.Text -cne
+            $expectedCandidateIdentityStatement) {
+        return $false
+    }
+
+    # 全critical helperのfunction extentを独立digest inventoryへ閉じる。個別の
+    # count/fixtureが未観測inputだけで分岐するearly returnやunary driftを見逃しても、
+    # helper sourceの同期変更にはこの第三oracleの明示更新が必要になる。
+    [string[]]$expectedFunctionDigests = @(
+        'ConvertFrom-StrictUtf8Bytes|tsBa0J2o/sshVVuta1sF2MVTtdXKVGgwTXiMDRAtHAU=',
+        'ConvertTo-LfTrimmedText|43JlyNcQrAHycigoq64eVyaRj6EPv2EoEg9JaeNsFNU=',
+        'ConvertTo-SafePathLabel|IxB/SDF4ht4bjjM26OargepX+a26VLxlbL91ylqJbgE=',
+        'Get-ByteDigest|VHxELR05D24VYoz4m6ol1QqDNGjZ94/pG7n9LSKZwpM=',
+        'Get-GitRegularMetadata|x4iq2of1ceS5DZ2khAYfw3T/atIWLXfaGz0ELPYLCoI=',
+        'Get-GitTrackedRegularFileIdentity|ExriN+q60xle2mXeguLL2RNvrKWq2sEO4tDeYfk166A=',
+        'Get-NormalizationCandidateIdentity|fJ59cGleCYdsqkQNoxkRPYSy4AuJxhc0V7Y3lcJGEG8=',
+        'Get-NormalizedRootPath|zp9N+RjNQJSW3KpxMm9X1h2epYA+n8cy/uD6p3ILick=',
+        'Test-GitRoutingEnvironmentClean|L2qaTQyQhJxyJdkzQXfUj26OcpcG+avlqobA+rI+6jE=',
+        'Test-RepositoryRegularFileBoundary|mYCOrdF3u9VSG2gnBQpdNDp7AtIoSAlGjVO06V8K8Bk='
+    )
+    $functionHasher = [System.Security.Cryptography.SHA256]::Create()
+    $functionUtf8 = [System.Text.UTF8Encoding]::new($false)
+    $actualFunctionDigests = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($functionAst in @(
+                $ast.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                    }, $true)
+            )) {
+            $functionDigest = [Convert]::ToBase64String(
+                $functionHasher.ComputeHash(
+                    $functionUtf8.GetBytes($functionAst.Extent.Text)
+                )
+            )
+            $actualFunctionDigests.Add($functionAst.Name + '|' + $functionDigest)
+        }
+    }
+    finally {
+        $functionHasher.Dispose()
+    }
+    [Array]::Sort($expectedFunctionDigests, [System.StringComparer]::Ordinal)
+    [string[]]$actualFunctionDigestArray = @($actualFunctionDigests)
+    [Array]::Sort($actualFunctionDigestArray, [System.StringComparer]::Ordinal)
+    if ($actualFunctionDigestArray.Count -ne $expectedFunctionDigests.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedFunctionDigests.Count; $index++) {
+        if ($actualFunctionDigestArray[$index] -cne
+            $expectedFunctionDigests[$index]) {
+            return $false
+        }
+    }
+    $traceRemoveCommands = @(
+        $commandAsts | Where-Object {
+            $_.GetCommandName() -ceq 'Microsoft.PowerShell.Management\Remove-Item'
+        }
+    )
+    if ($traceRemoveCommands.Count -ne 1 -or
+        $traceRemoveCommands[0].CommandElements.Count -ne 5 -or
+        $traceCleanupLoop.Body.Statements[0].Extent.Text -cne
+            $traceRemoveCommands[0].Extent.Text) {
+        return $false
+    }
+    [string[]]$expectedTraceRemoveElements = @(
+        'Microsoft.PowerShell.Management\Remove-Item',
+        '-LiteralPath',
+        '"Env:$traceName"',
+        '-ErrorAction',
+        'Stop'
+    )
+    for ($index = 0; $index -lt $expectedTraceRemoveElements.Count; $index++) {
+        if ($traceRemoveCommands[0].CommandElements[$index].Extent.Text -cne
+            $expectedTraceRemoveElements[$index]) {
+            return $false
+        }
+    }
+
+    $expectedMemberCounts = [System.Collections.Generic.Dictionary[string, int]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($entry in @(
+            @{ Signature = '[char]|ConvertToUtf32|True'; Count = 1 },
+            @{ Signature = '[char]|IsHighSurrogate|True'; Count = 1 },
+            @{ Signature = '[char]|IsLowSurrogate|True'; Count = 1 },
+            @{ Signature = '[Convert]|ToBase64String|True'; Count = 1 },
+            @{ Signature = '[Environment]|GetEnvironmentVariables|True'; Count = 1 },
+            @{ Signature = '[Environment]|SetEnvironmentVariable|True'; Count = 1 },
+            @{ Signature = '[string]|Equals|True'; Count = 4 },
+            @{ Signature = '[string]|IsNullOrEmpty|True'; Count = 6 },
+            @{ Signature = '[System.Globalization.CharUnicodeInfo]|GetUnicodeCategory|True'; Count = 1 },
+            @{ Signature = '[System.IO.Directory]|GetParent|True'; Count = 1 },
+            @{ Signature = '[System.IO.File]|Exists|True'; Count = 1 },
+            @{ Signature = '[System.IO.File]|GetAttributes|True'; Count = 1 },
+            @{ Signature = '[System.IO.File]|ReadAllBytes|True'; Count = 2 },
+            @{ Signature = '[System.IO.File]|WriteAllText|True'; Count = 1 },
+            @{ Signature = '[System.IO.Path]|Combine|True'; Count = 2 },
+            @{ Signature = '[System.IO.Path]|GetFullPath|True'; Count = 3 },
+            @{ Signature = '[System.IO.Path]|GetPathRoot|True'; Count = 1 },
+            @{ Signature = '[System.IO.Path]|IsPathRooted|True'; Count = 1 },
+            @{ Signature = '[System.Security.Cryptography.SHA256]|Create|True'; Count = 1 },
+            @{ Signature = '[System.Text.StringBuilder]|new|True'; Count = 1 },
+            @{ Signature = '[System.Text.UTF8Encoding]|new|True'; Count = 2 },
+            @{ Signature = '$builder|Append|False'; Count = 2 },
+            @{ Signature = '$builder|AppendFormat|False'; Count = 2 },
+            @{ Signature = '$builder|ToString|False'; Count = 1 },
+            @{ Signature = '$candidateFull|StartsWith|False'; Count = 1 },
+            @{ Signature = '$full|TrimEnd|False'; Count = 1 },
+            @{ Signature = '$lines[$index]|TrimEnd|False'; Count = 1 },
+            @{ Signature = '$metadata|Split|False'; Count = 1 },
+            @{ Signature = '$Raw|Split|False'; Count = 1 },
+            @{ Signature = '$records[0]|IndexOf|False'; Count = 1 },
+            @{ Signature = '$records[0]|Substring|False'; Count = 1 },
+            @{ Signature = '$RelativePath|Substring|False'; Count = 1 },
+            @{ Signature = '$rootPrefix|EndsWith|False'; Count = 1 },
+            @{ Signature = '$sha256|ComputeHash|False'; Count = 1 },
+            @{ Signature = '$sha256|Dispose|False'; Count = 1 },
+            @{ Signature = '$strictUtf8|GetString|False'; Count = 1 },
+            @{ Signature = '$Text.Replace("`r`n", "`n")|Replace|False'; Count = 1 },
+            @{ Signature = '$Text|Replace|False'; Count = 1 }
+        )) {
+        $expectedMemberCounts.Add($entry.Signature, $entry.Count)
+    }
+    $actualMemberCounts = [System.Collections.Generic.Dictionary[string, int]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $memberAsts = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+            }, $true)
+    )
+    foreach ($memberAst in $memberAsts) {
+        $signature = (
+            $memberAst.Expression.Extent.Text + '|' +
+            $memberAst.Member.Extent.Text + '|' +
+            [string]$memberAst.Static
+        )
+        if (-not $expectedMemberCounts.ContainsKey($signature)) {
+            return $false
+        }
+        if (-not $actualMemberCounts.ContainsKey($signature)) {
+            $actualMemberCounts.Add($signature, 0)
+        }
+        $actualMemberCounts[$signature]++
+    }
+    foreach ($signature in $expectedMemberCounts.Keys) {
+        if (-not $actualMemberCounts.ContainsKey($signature) -or
+            $actualMemberCounts[$signature] -ne $expectedMemberCounts[$signature]) {
+            return $false
+        }
+    }
+    $traceSetMembers = @(
+        $memberAsts | Where-Object {
+            $_.Expression.Extent.Text -ceq '[Environment]' -and
+                $_.Member.Extent.Text -ceq 'SetEnvironmentVariable'
+        }
+    )
+    if ($traceSetMembers.Count -ne 1 -or
+        $traceSetMembers[0].Extent.Text -cne
+            "[Environment]::SetEnvironmentVariable(`$traceName, '0', 'Process')") {
+        return $false
+    }
+
+    $expectedTypeCounts = [System.Collections.Generic.Dictionary[string, int]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($entry in @(
+            @{ Name = 'System.Char'; Count = 3 },
+            @{ Name = 'System.Convert'; Count = 1 },
+            @{ Name = 'System.Environment'; Count = 2 },
+            @{ Name = 'System.String'; Count = 10 },
+            @{ Name = 'System.Globalization.CharUnicodeInfo'; Count = 1 },
+            @{ Name = 'System.Globalization.UnicodeCategory'; Count = 5 },
+            @{ Name = 'System.IO.Directory'; Count = 1 },
+            @{ Name = 'System.IO.File'; Count = 5 },
+            @{ Name = 'System.IO.FileAttributes'; Count = 3 },
+            @{ Name = 'System.IO.Path'; Count = 11 },
+            @{ Name = 'System.Security.Cryptography.SHA256'; Count = 1 },
+            @{ Name = 'System.StringComparison'; Count = 5 },
+            @{ Name = 'System.StringSplitOptions'; Count = 2 },
+            @{ Name = 'System.Text.StringBuilder'; Count = 1 },
+            @{ Name = 'System.Text.UTF8Encoding'; Count = 2 }
+        )) {
+        $expectedTypeCounts.Add($entry.Name, $entry.Count)
+    }
+    $actualTypeCounts = [System.Collections.Generic.Dictionary[string, int]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $typeAsts = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.TypeExpressionAst]
+            }, $true)
+    )
+    foreach ($typeAst in $typeAsts) {
+        $resolvedType = $typeAst.TypeName.GetReflectionType()
+        if ($null -eq $resolvedType -or
+            -not $expectedTypeCounts.ContainsKey($resolvedType.FullName)) {
+            return $false
+        }
+        if (-not $actualTypeCounts.ContainsKey($resolvedType.FullName)) {
+            $actualTypeCounts.Add($resolvedType.FullName, 0)
+        }
+        $actualTypeCounts[$resolvedType.FullName]++
+    }
+    foreach ($typeName in $expectedTypeCounts.Keys) {
+        if (-not $actualTypeCounts.ContainsKey($typeName) -or
+            $actualTypeCounts[$typeName] -ne $expectedTypeCounts[$typeName]) {
+            return $false
+        }
+    }
+
+    $traceAssignments = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left.Extent.Text.EndsWith(
+                        '$trace2OverrideNames',
+                        [System.StringComparison]::Ordinal
+                    )
+            }, $true)
+    )
+    if ($traceAssignments.Count -ne 1 -or
+        $traceAssignments[0].Right.Extent.Text -cne
+            "@('GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')") {
+        return $false
+    }
+
+    # LHSだけのallowlistでは既存変数への再代入を見逃す。全assignmentの
+    # exact LHSとRHS source digestを独立oracleとして固定する。
+    [string[]]$expectedAssignmentSignatures = @(
+        '[string[]]$fields|rVo4Q3B1kHhBioFD+7btV1byBfDA5C7tzzE1QEXTWPY=',
+        '[string[]]$lines|Xsgabj7H2HurJyzglW0P9gFD440DdH/MBYWnByWqOA0=',
+        '[string[]]$records|jC9Q5x+X3xnnPDXJTVbAs8acA+5bVzyMhf/0qWp0fyA=',
+        '[string[]]$relativePaths|oJ+xUZh44QFU2OPB7d0CTsChVnmMzCkdNOfNyZo3H18=',
+        '$actualTopLevel|SIe7JNo5Pj0oFD4Tif3Vl5GoGA4/p7xNWJu0600T7wg=',
+        '$attributes|34VvIK2PefX72tbqWUrCSRbbf4W/CA5K8IRf6IFAaiY=',
+        '$blockedNames|pfQK5aJHufDA4SQ7HtOAmSAZF5UOD86kcpFecr/hsY8=',
+        '$bomLength|TgdAhWK+24tgzgXB3s/jrRa3IjCWfeAfZAt+Rym0n84=',
+        '$bomLength|X+zrZv/IbzjZUnhsbWlsecLbwjndTpG0ZynXOif7V+k=',
+        '$builder|V3HU81fCnJ1zHtNbx8sB4Crb9eAFRKuQcdiRRB57Szg=',
+        '$candidateFull|8aGMVu9w7ffTy1aroLQwZf4JpSoQ2ts/ZS0EIrFeQkc=',
+        '$candidateIdentity|myf+6gLWVnO5dvalV74FOhvM7iGgRIDe+HjrJw/zlU4=',
+        '$category|7HzGPWsNwlKUVOONIDc38uGQXyooco+xrGWSfAuYCHc=',
+        '$codePoint|ckcZR2PIqC3LLxXba/LQcfGOkPAvmQRqRqFmwAIcjwI=',
+        '$codePoint|DIlwdmxOAuAHJznuqLhSlb9cAtQ5d2q+uc7r4DwWRaw=',
+        '$comparison|79K+KeGsxDnh/tuepKixAnxslRTUOOS/hamXZT1MoQg=',
+        '$current|3QVoO7tcwgl8Hlmd/DUPW6uI0GIHgDI55iRfxed6tbI=',
+        '$current|NQIj+LUUlwZuQITYiYVPDDva6qEQfaBDUjgRlTzR78Y=',
+        '$full|OX5F/k9EQSMynrYaUBNmYUZjooTfnaOOM9l6AujzCuE=',
+        '$gitApplications|4KEigmzrTtXIRN+vviAaxlkLXwOmDGTAyDcFyEToWIY=',
+        '$gitExecutable|Ck1bg9+ZyNgGVGE62oLKDf5E58pDa02QSEAx77aHIRQ=',
+        '$headMetadata|wnuXGNEMQCIF2AKr7Y+Cybo0H+/iZOuTuGirXlv3VZI=',
+        '$index|lIzB2k/Dx17dqAAoy2l3cEo/cp8v+kVWzDyjUBvyYZQ=',
+        '$index|X+zrZv/IbzjZUnhsbWlsecLbwjndTpG0ZynXOif7V+k=',
+        '$index|X+zrZv/IbzjZUnhsbWlsecLbwjndTpG0ZynXOif7V+k=',
+        '$indexMetadata|ZFc8mQFIjuYlHuYDkQfzfer4W+Qpyg8zz1kjjV0BtZs=',
+        '$isCandidate|85Hx1L7pTkr/QhDigxE6q4maT35T32ZciwJSzE8PsIg=',
+        '$isCandidate|pocBIs/VGusjp6CNgWh2Er/c84gXaPJ8PefBktugXYk=',
+        '$latestDigest|119n8rn0jMr2q3PcXko/UM6n17hA07CR7uPb/ufZQu4=',
+        '$latestDigest|TnSWt7KKmeADNSz9C52oaG88MYTm4fQXsN8uHbRCb7U=',
+        '$latestIdentity|myf+6gLWVnO5dvalV74FOhvM7iGgRIDe+HjrJw/zlU4=',
+        '$lines[$index]|7eYW0zZALPQDGv9pORDNWa75TDKzQmzAYAvlqrDf+Xs=',
+        '$literalPathSpec|laJwGMiv4FFppw7tpDYHXXEG/4nHfwihxhZpmk5KX8o=',
+        '$metadata|TICol9Sd7yFwFcCkBHDLfQ1I1HAEs6ET3EVHPT760kU=',
+        '$name|sUQh4VdBfCFJQZ47almfxB/xS3q5Fs5tKjwH5SWL3n8=',
+        '$normalized|38KE9UyHNXEAWeFB6DPt2cO7U3Y1lO0snkm++KRxfJs=',
+        '$originalBytes|VARFc7StuBGtXq8iDvkx8fXbPmfk9+zuP+Koy8MIqh8=',
+        '$originalDigest|h5T9tHfvI2R+/KBO99/8RAm6F80UM74cbotmIrG5Gs0=',
+        '$parent|aaJUAhkz4tyu9ab6fCx43HEHuaeLg8g23f8qZEUV6dc=',
+        '$path|g+Ww8h+uLgtHy7CWlc4oyeOiAuZWOnZU2aaFoiJ/OcE=',
+        '$rawHead|5TIes8miZX96VzGO1muolEhTAKTOHNNfFwFzE8d9ivo=',
+        '$rawIndex|wXS7c9cDwEu+FsQfQ7nZXQ8ZnFBS8VCEQZLPR2bsfDw=',
+        '$repo|ur+US5CCILxwdtjCW/V1FseVGuBOoPS9oeIKv8hUVw4=',
+        '$rootBoundary|UGMdL68SiE0HFADHDV6HVm9lWduQmaAAYdFayfgUWPk=',
+        '$rootBoundary|UGMdL68SiE0HFADHDV6HVm9lWduQmaAAYdFayfgUWPk=',
+        '$rootPrefix|qfJTd7XNfrbjskaFXhCUcHzofghU5Zs53YrPminl27c=',
+        '$rootPrefix|qGM6ma8SXpCgwl+lq8hlD7mPOPWkSxK/x4I8LoKvtI4=',
+        '$safeLabel|o+BD9vB/hvY7NGck142KiWm3Ht9xQRNIJifbE6dohGE=',
+        '$scalarLength|1HNeOiZeFu7gP1lxi5tdAwGcB9i2xR+Q2jpmbuwTqzU=',
+        '$scalarLength|a4ayc/80/OGda4BO/1o/V0etpOqiLx1JwB5S3beHW0s=',
+        '$sha256|BV7jSBs1i1OBHJnxV90QETz4gBCvX0fByGwtZgel6Es=',
+        '$skipped|1GgNRgrf5nEVNOZhyGFKoLcj5py4jdJ/lpMss/hWtvA=',
+        '$skipped|fYpD8GQDXC12a30f/ADV92UMI3TpQFNm6o2+C1BDlT4=',
+        '$skipped|ix9MotUP9aZIUAnze2fsw/duT3NhGCXD0qgsFacnriA=',
+        '$skipped|MwkfZfOXiuVYxgD8vw/2Mg9J//Dys5Un4Oqp6dWtTsw=',
+        '$skipped|Ok85whIY0jl4BJjKbAmEXdxIIoi7v3NSKWwwB5l6TLQ=',
+        '$strictUtf8|U1yxA5x99gzfu8sJkaILJN9CmUdM+muVYrFbH2lYjDc=',
+        '$t|BY6SCgRuQPCvpMNH1+EGbJbK/YjLvkvBCRgBOACMJ2k=',
+        '$t|U4KzLe7ND1QLE3oMIHMvdII/EIoNA1zWSpZUoqq1Xgk=',
+        '$tabIndex|cEDc5oVLO/Vu9Yz95MYm8KLNa0hnmaoqCMwUK4ObpjA=',
+        '$topLevelOutput|VPtnlKIRGxBbonG/8lZUNrT9uX1JeOkIo6HX/S6Cw1c=',
+        '$trace2OverrideNames|ecn42PjxdK/JuktFjEV9bh52k91kihDxzWptQYTs8P8=',
+        '$volumeRoot|Xg1ASR20AEOqfbP8WJJ8PoM/r/te/m2Gnu4sHp0OVto='
+    )
+    $assignmentHasher = [System.Security.Cryptography.SHA256]::Create()
+    $assignmentUtf8 = [System.Text.UTF8Encoding]::new($false)
+    $actualAssignmentSignatures = [System.Collections.Generic.List[string]]::new()
+    try {
+        $assignmentAsts = @(
+            $ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+                }, $true)
+        )
+        foreach ($assignmentAst in $assignmentAsts) {
+            $rightBytes = $assignmentUtf8.GetBytes($assignmentAst.Right.Extent.Text)
+            $rightDigest = [Convert]::ToBase64String(
+                $assignmentHasher.ComputeHash($rightBytes)
+            )
+            $actualAssignmentSignatures.Add(
+                $assignmentAst.Left.Extent.Text + '|' + $rightDigest
+            )
+        }
+    }
+    finally {
+        $assignmentHasher.Dispose()
+    }
+    [Array]::Sort($expectedAssignmentSignatures, [System.StringComparer]::Ordinal)
+    [string[]]$actualAssignmentSignatureArray = @($actualAssignmentSignatures)
+    [Array]::Sort($actualAssignmentSignatureArray, [System.StringComparer]::Ordinal)
+    if ($actualAssignmentSignatureArray.Count -ne $expectedAssignmentSignatures.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedAssignmentSignatures.Count; $index++) {
+        if ($actualAssignmentSignatureArray[$index] -cne
+            $expectedAssignmentSignatures[$index]) {
+            return $false
+        }
+    }
+    [string[]]$expectedPlusAssignmentSignatures = @(
+        '$bomLength|TgdAhWK+24tgzgXB3s/jrRa3IjCWfeAfZAt+Rym0n84=',
+        '$index|lIzB2k/Dx17dqAAoy2l3cEo/cp8v+kVWzDyjUBvyYZQ=',
+        '$rootPrefix|qfJTd7XNfrbjskaFXhCUcHzofghU5Zs53YrPminl27c=',
+        '$skipped|1GgNRgrf5nEVNOZhyGFKoLcj5py4jdJ/lpMss/hWtvA=',
+        '$skipped|fYpD8GQDXC12a30f/ADV92UMI3TpQFNm6o2+C1BDlT4=',
+        '$skipped|ix9MotUP9aZIUAnze2fsw/duT3NhGCXD0qgsFacnriA=',
+        '$skipped|Ok85whIY0jl4BJjKbAmEXdxIIoi7v3NSKWwwB5l6TLQ='
+    )
+    $actualPlusAssignmentSignatures = [System.Collections.Generic.List[string]]::new()
+    foreach ($assignmentAst in $assignmentAsts) {
+        if ($assignmentAst.Operator -notin @(
+                [System.Management.Automation.Language.TokenKind]::Equals,
+                [System.Management.Automation.Language.TokenKind]::PlusEquals
+            )) {
+            return $false
+        }
+        if ($assignmentAst.Operator -eq
+            [System.Management.Automation.Language.TokenKind]::PlusEquals) {
+            $rightBytes = $assignmentUtf8.GetBytes($assignmentAst.Right.Extent.Text)
+            $rightHasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $rightDigest = [Convert]::ToBase64String(
+                    $rightHasher.ComputeHash($rightBytes)
+                )
+            }
+            finally {
+                $rightHasher.Dispose()
+            }
+            $actualPlusAssignmentSignatures.Add(
+                $assignmentAst.Left.Extent.Text + '|' + $rightDigest
+            )
+        }
+    }
+    [Array]::Sort($expectedPlusAssignmentSignatures, [System.StringComparer]::Ordinal)
+    [string[]]$actualPlusAssignmentSignatureArray = @(
+        $actualPlusAssignmentSignatures
+    )
+    [Array]::Sort(
+        $actualPlusAssignmentSignatureArray,
+        [System.StringComparer]::Ordinal
+    )
+    if ($actualPlusAssignmentSignatureArray.Count -ne
+        $expectedPlusAssignmentSignatures.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedPlusAssignmentSignatures.Count; $index++) {
+        if ($actualPlusAssignmentSignatureArray[$index] -cne
+            $expectedPlusAssignmentSignatures[$index]) {
+            return $false
+        }
+    }
+
+    # Canonical native stderr redirectionは3個の2>$nullだけ。他pathへの
+    # redirectionを追加して別sinkを作る変更は拒否する。
+    $redirections = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FileRedirectionAst]
+            }, $true)
+    )
+    if ($redirections.Count -ne 3) {
+        return $false
+    }
+    foreach ($redirection in $redirections) {
+        if ($redirection.Extent.Text -cne '2>$null') {
+            return $false
+        }
+    }
+
+    $targetAssignments = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left.Extent.Text.EndsWith(
+                        '$relativePaths',
+                        [System.StringComparison]::Ordinal
+                    )
+            }, $true)
+    )
+    if ($targetAssignments.Count -ne 1) {
+        return $false
+    }
+    $rewriteLoops = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                    $node.Extent.Text.Contains(
+                        '[System.IO.File]::WriteAllText($path, $t,'
+                    )
+            }, $true)
+    )
+    if ($rewriteLoops.Count -ne 1 -or
+        $rewriteLoops[0].Parent -isnot
+            [System.Management.Automation.Language.NamedBlockAst] -or
+        $rewriteLoops[0].Variable.Extent.Text -cne '$relativePath' -or
+        $rewriteLoops[0].Condition.Extent.Text -cne '$relativePaths') {
+        return $false
+    }
+    # Final identity/digest guard must remain immediately before the sole write.
+    # Allowlisted descendants/countsだけでは、writeをguard前へ移すreorderを見逃す。
+    $rewriteStatements = @($rewriteLoops[0].Body.Statements)
+    [string[]]$expectedRewriteStatementTypes = @(
+        'AssignmentStatementAst',
+        'AssignmentStatementAst',
+        'IfStatementAst',
+        'AssignmentStatementAst',
+        'TryStatementAst',
+        'AssignmentStatementAst',
+        'AssignmentStatementAst',
+        'TryStatementAst',
+        'IfStatementAst',
+        'TryStatementAst'
+    )
+    if ($rewriteStatements.Count -ne $expectedRewriteStatementTypes.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedRewriteStatementTypes.Count; $index++) {
+        if ($rewriteStatements[$index].GetType().Name -cne
+            $expectedRewriteStatementTypes[$index]) {
+            return $false
+        }
+    }
+    # Top-level rewrite phaseは順序付きstatement digestでも固定する。sortedな
+    # assignment oracleだけではcandidate/path等の同型statement swapを検出できない。
+    [string[]]$expectedRewriteStatementDigests = @(
+        'Lmlzr4ZejNEoQaJu2MMNRBt0p5RciH+aJ+l7mflglJw=',
+        'E7PrK13dme92upbr+BBGCMlpcJwE5cXeE3dAvvOVtSo=',
+        'mtUNeVA6gz1KL2gbKytM8eujYLY2wSBwmsKFcPNUVuY=',
+        'aqpF7bzViaNCLpq5RIl8F9Y6lhR1SFLwLZflCHU1RFU=',
+        'Eggbhq5iPzrYOLigSZo/2aL+QFmgK+bTYueEO31Yi3Y=',
+        '2kpfwoFHiMo3LyB5EeywrFq14XkbxpT6NNVT3sLnp2c=',
+        'raEmT0jRJ+JQvegYT7/nOO3/51VqcpM3v1QMuuVg8VI=',
+        'j8LBP8LtmSUMVoOv36ilMCMfYeJbow8k45zjtpv/mp8=',
+        'mSApJbcT6f1C66aJCpi76VlDajRAg6P+oESOAlmqP68=',
+        'sue4ltC+TK/btkNKBF4Q91MA2IfTKEBKQhdwPupn5+4='
+    )
+    $rewriteHasher = [System.Security.Cryptography.SHA256]::Create()
+    $rewriteUtf8 = [System.Text.UTF8Encoding]::new($false)
+    try {
+        for ($index = 0; $index -lt $rewriteStatements.Count; $index++) {
+            $rewriteDigest = [Convert]::ToBase64String(
+                $rewriteHasher.ComputeHash(
+                    $rewriteUtf8.GetBytes($rewriteStatements[$index].Extent.Text)
+                )
+            )
+            if ($rewriteDigest -cne $expectedRewriteStatementDigests[$index]) {
+                return $false
+            }
+        }
+    }
+    finally {
+        $rewriteHasher.Dispose()
+    }
+    $initialGuard = $rewriteStatements[2]
+    if ($initialGuard.Clauses.Count -ne 1 -or
+        $null -ne $initialGuard.ElseClause -or
+        $initialGuard.Clauses[0].Item1.Extent.Text -cne
+            '[string]::IsNullOrEmpty([string]$candidateIdentity)' -or
+        $initialGuard.Clauses[0].Item2.Statements.Count -ne 2 -or
+        $initialGuard.Clauses[0].Item2.Statements[0].Extent.Text -cne
+            '$skipped += "$safeLabel (unsafe path, Git environment, or identity)"' -or
+        $initialGuard.Clauses[0].Item2.Statements[1] -isnot
+            [System.Management.Automation.Language.ContinueStatementAst] -or
+        $initialGuard.Clauses[0].Item2.Statements[1].Extent.Text -cne 'continue') {
+        return $false
+    }
+
+    # Full exampleのread失敗も必ずcurrent targetをcontinueする。short guideだけを
+    # 固定しても、canonical loopがstale/uninitialized $tへfall throughできてしまう。
+    $guardedReadTry = $rewriteStatements[4]
+    [string[]]$expectedFullReadLeft = @('$originalBytes', '$originalDigest', '$t')
+    [string[]]$expectedFullReadRight = @(
+        '[System.IO.File]::ReadAllBytes($path)',
+        'Get-ByteDigest -Bytes $originalBytes',
+        'ConvertFrom-StrictUtf8Bytes -Bytes $originalBytes'
+    )
+    if ($guardedReadTry.Body.Statements.Count -ne 3 -or
+        $guardedReadTry.CatchClauses.Count -ne 2 -or
+        $null -ne $guardedReadTry.Finally -or
+        $guardedReadTry.CatchClauses[0].CatchTypes.Count -ne 1 -or
+        $guardedReadTry.CatchClauses[0].CatchTypes[0].TypeName.FullName -cne
+            'System.Text.DecoderFallbackException' -or
+        $guardedReadTry.CatchClauses[1].CatchTypes.Count -ne 0) {
+        return $false
+    }
+    for ($index = 0; $index -lt 3; $index++) {
+        $readStatement = $guardedReadTry.Body.Statements[$index]
+        if ($readStatement -isnot
+                [System.Management.Automation.Language.AssignmentStatementAst] -or
+            $readStatement.Operator -ne
+                [System.Management.Automation.Language.TokenKind]::Equals -or
+            $readStatement.Left.Extent.Text -cne $expectedFullReadLeft[$index] -or
+            $readStatement.Right.Extent.Text -cne $expectedFullReadRight[$index]) {
+            return $false
+        }
+    }
+    [string[]]$expectedReadFailureAssignments = @(
+        '$skipped += "$safeLabel (strict decode failed)"',
+        '$skipped += "$safeLabel (read or digest failed)"'
+    )
+    for ($catchIndex = 0; $catchIndex -lt 2; $catchIndex++) {
+        $catchStatements = @(
+            $guardedReadTry.CatchClauses[$catchIndex].Body.Statements
+        )
+        if ($catchStatements.Count -ne 2 -or
+            $catchStatements[0].Extent.Text -cne
+                $expectedReadFailureAssignments[$catchIndex] -or
+            $catchStatements[1] -isnot
+                [System.Management.Automation.Language.ContinueStatementAst] -or
+            $catchStatements[1].Extent.Text -cne 'continue') {
+            return $false
+        }
+    }
+
+    $finalGuard = $rewriteStatements[8]
+    $finalWriteTry = $rewriteStatements[9]
+    $expectedFinalGuardCondition = @'
+-not [string]::Equals(
+            [string]$candidateIdentity,
+            [string]$latestIdentity,
+            [System.StringComparison]::Ordinal
+        ) -or
+        -not [string]::Equals(
+            [string]$originalDigest,
+            [string]$latestDigest,
+            [System.StringComparison]::Ordinal
+        )
+'@
+    if ($finalGuard.Clauses.Count -ne 1 -or
+        $null -ne $finalGuard.ElseClause -or
+        $finalGuard.Clauses[0].Item1.Extent.Text -cne
+            $expectedFinalGuardCondition -or
+        $finalGuard.Clauses[0].Item2.Statements.Count -ne 2 -or
+        $finalGuard.Clauses[0].Item2.Statements[0].Extent.Text -cne
+            '$skipped += "$safeLabel (path, Git identity, or bytes changed before write)"' -or
+        $finalGuard.Clauses[0].Item2.Statements[1] -isnot
+            [System.Management.Automation.Language.ContinueStatementAst] -or
+        $finalGuard.Clauses[0].Item2.Statements[1].Extent.Text -cne 'continue' -or
+        $finalGuard.Extent.EndOffset -ge $finalWriteTry.Extent.StartOffset -or
+        $finalWriteTry.Body.Statements.Count -ne 1 -or
+        $finalWriteTry.Body.Statements[0].Extent.Text -cne
+            '[System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))' -or
+        $finalWriteTry.CatchClauses.Count -ne 1 -or
+        $null -ne $finalWriteTry.Finally -or
+        $finalWriteTry.CatchClauses[0].Body.Statements.Count -ne 1 -or
+        $finalWriteTry.CatchClauses[0].Body.Statements[0] -isnot
+            [System.Management.Automation.Language.ThrowStatementAst] -or
+        $finalWriteTry.CatchClauses[0].Body.Statements[0].Extent.Text -cne
+            "throw 'Normalization write failed; stop immediately and recover the guarded target before continuing.'") {
+        return $false
+    }
+    $writeMembers = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    $node.Expression.Extent.Text -ceq '[System.IO.File]' -and
+                    $node.Member.Extent.Text -ceq 'WriteAllText'
+            }, $true)
+    )
+    if ($writeMembers.Count -ne 1) {
+        return $false
+    }
+    $writeAncestor = $writeMembers[0].Parent
+    while ($null -ne $writeAncestor -and
+        -not [object]::ReferenceEquals($writeAncestor, $finalWriteTry.Body)) {
+        $writeAncestor = $writeAncestor.Parent
+    }
+    if ($null -eq $writeAncestor) {
         return $false
     }
     return $true
+}
+
+function Test-GuardedNormalizationExampleContract {
+    param([string]$Source)
+
+    $fencedCode = Get-GuardedNormalizationPatternCode -Source $Source
+    if ([string]::IsNullOrWhiteSpace([string]$fencedCode) -or
+        -not (Test-GuardedNormalizationPatternAstSafety -FencedCode $fencedCode)) {
+        return $false
+    }
+    $expectedCode = Get-GuardedNormalizationExpectedPatternCode
+    if (
+        -not [string]::Equals(
+            $fencedCode,
+            $expectedCode,
+            [System.StringComparison]::Ordinal
+        )) {
+        return $false
+    }
+
+    # exact oracleに加えて、上の独立AST allowlistと構造検査を重ねる。
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $fencedCode,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if (@($parseErrors).Count -ne 0) {
+        return $false
+    }
+
+    $requiredFunctions = @(
+        'Test-GitRoutingEnvironmentClean',
+        'Get-NormalizedRootPath',
+        'Get-GitRegularMetadata',
+        'Get-GitTrackedRegularFileIdentity',
+        'Test-RepositoryRegularFileBoundary',
+        'Get-NormalizationCandidateIdentity',
+        'Get-ByteDigest',
+        'ConvertFrom-StrictUtf8Bytes',
+        'ConvertTo-LfTrimmedText',
+        'ConvertTo-SafePathLabel'
+    )
+    $functionDefinitions = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }, $true)
+    )
+    foreach ($requiredFunction in $requiredFunctions) {
+        if (@(
+                $functionDefinitions |
+                    Where-Object { $_.Name -ceq $requiredFunction }
+            ).Count -ne 1) {
+            return $false
+        }
+    }
+    if ($functionDefinitions.Count -ne $requiredFunctions.Count) {
+        return $false
+    }
+
+    $assignments = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+            }, $true)
+    )
+    $targetAssignments = @(
+        $assignments | Where-Object {
+            $_.Left.Extent.Text.EndsWith(
+                '$relativePaths',
+                [System.StringComparison]::Ordinal
+            )
+        }
+    )
+    if ($targetAssignments.Count -ne 1) {
+        return $false
+    }
+
+    $candidateCalls = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -ceq 'Get-NormalizationCandidateIdentity'
+            }, $true)
+    )
+    if ($candidateCalls.Count -ne 2) {
+        return $false
+    }
+
+    $unsafeWriteCommands = @(
+        $ast.FindAll({
+                param($node)
+                if ($node -isnot [System.Management.Automation.Language.CommandAst]) {
+                    return $false
+                }
+                return $node.GetCommandName() -cin @(
+                    'Set-Content',
+                    'Add-Content',
+                    'Out-File',
+                    'Copy-Item',
+                    'Move-Item',
+                    'Remove-Item',
+                    'New-Item'
+                )
+            }, $true)
+    )
+    if ($unsafeWriteCommands.Count -ne 0) {
+        return $false
+    }
+
+    $fileWriteMembers = @(
+        $ast.FindAll({
+                param($node)
+                if ($node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
+                    return $false
+                }
+                if ($node.Expression.Extent.Text -cne '[System.IO.File]') {
+                    return $false
+                }
+                return $node.Member.Extent.Text -cin @(
+                    'WriteAllText',
+                    'WriteAllBytes',
+                    'WriteAllLines',
+                    'AppendAllText',
+                    'AppendAllLines',
+                    'OpenWrite',
+                    'CreateText',
+                    'Create'
+                )
+            }, $true)
+    )
+    if ($fileWriteMembers.Count -ne 1 -or
+        $fileWriteMembers[0].Member.Extent.Text -cne 'WriteAllText') {
+        return $false
+    }
+
+    $rewriteLoops = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                    $node.Extent.Text.Contains(
+                        '$candidateIdentity = Get-NormalizationCandidateIdentity'
+                    ) -and
+                    $node.Extent.Text.Contains(
+                        '[System.IO.File]::WriteAllText($path, $t,'
+                    )
+            }, $true)
+    )
+    if ($rewriteLoops.Count -ne 1 -or
+        $rewriteLoops[0].Parent -isnot
+            [System.Management.Automation.Language.NamedBlockAst] -or
+        -not $rewriteLoops[0].Extent.Text.Contains(
+            '$latestDigest = Get-ByteDigest -Bytes ('
+        )) {
+        return $false
+    }
+
+    $requiredFragments = @(
+        '[Environment]::GetEnvironmentVariables().Keys',
+        "'GIT_INDEX_FILE'",
+        "'GIT_ICASE_PATHSPECS'",
+        "'GIT_NO_LAZY_FETCH'",
+        "`$name -like 'GIT_CONFIG_KEY_*'",
+        "`$name -like 'GIT_TRACE*'",
+        'Microsoft.PowerShell.Core\Get-Command',
+        "[Environment]::SetEnvironmentVariable(`$traceName, '0', 'Process')",
+        'Microsoft.PowerShell.Management\Remove-Item',
+        '& $gitExecutable --no-replace-objects --no-lazy-fetch -C $rootBoundary rev-parse --show-toplevel',
+        "':(literal)' + `$RelativePath",
+        'ls-files --stage -z -- $literalPathSpec',
+        'ls-tree -z HEAD -- $literalPathSpec',
+        "`$fields[0] -notin @('100644', '100755')",
+        "`$fields[2] -ne '0'",
+        "`$fields[1] -cne 'blob'",
+        '[System.StringComparison]::Ordinal',
+        '[System.IO.FileAttributes]::ReparsePoint',
+        '[System.IO.File]::ReadAllBytes($path)',
+        'Get-ByteDigest -Bytes $originalBytes',
+        'ConvertFrom-StrictUtf8Bytes -Bytes $originalBytes',
+        'ConvertTo-LfTrimmedText -Text $t',
+        'ConvertTo-SafePathLabel -RelativePath $relativePath',
+        '[System.Globalization.UnicodeCategory]::Format',
+        '[char]::ConvertToUtf32('
+    )
+    foreach ($fragment in $requiredFragments) {
+        if ((Get-OrdinalFragmentCount -Content $fencedCode -Fragment $fragment) -lt 1) {
+            return $false
+        }
+    }
+    foreach ($forbiddenFragment in @(
+            'status --porcelain',
+            '$entries =',
+            '$files ='
+        )) {
+        if ((Get-OrdinalFragmentCount `
+                -Content $fencedCode `
+                -Fragment $forbiddenFragment) -ne 0) {
+            return $false
+        }
+    }
+    if ((Get-OrdinalFragmentCount `
+            -Content $fencedCode `
+            -Fragment '[System.IO.File]::ReadAllBytes($path)') -ne 2 -or
+        (Get-OrdinalFragmentCount `
+            -Content $fencedCode `
+            -Fragment '[System.IO.File]::WriteAllText($path, $t,') -ne 1) {
+        return $false
+    }
+    return $true
+}
+
+function Test-NormalizationSkillReadCatchContract {
+    param([string]$Source)
+
+    if ([string]::IsNullOrWhiteSpace($Source)) {
+        return $false
+    }
+
+    # step 4のnormalization region自体をsource位置でanchorする。別sectionやHTML
+    # commentへcanonical decoy fenceを置いてactual手順のunsafe sinkを隠せない。
+    $normalizedSource = $Source.Replace("`r`n", "`n")
+    if ($normalizedSource.Contains('<!--') -or
+        $normalizedSource.Contains('-->')) {
+        return $false
+    }
+    $normalizationHeadings = [regex]::Matches(
+        $normalizedSource,
+        '(?m)^### (?:Normalization|正規化)[^\n]*$'
+    )
+    if ($normalizationHeadings.Count -ne 1) {
+        return $false
+    }
+    $normalizationTail = $normalizedSource.Substring(
+        $normalizationHeadings[0].Index
+    )
+    $stepFive = [regex]::Match($normalizationTail, '(?m)^5\. ')
+    if (-not $stepFive.Success) {
+        return $false
+    }
+    $normalizationRegion = $normalizationTail.Substring(0, $stepFive.Index)
+    $anchoredFences = [regex]::Matches(
+        $normalizationRegion,
+        '(?ms)^[ \t]*```powershell[ \t]*\n(?<code>.*?)^[ \t]*```[ \t]*$'
+    )
+    if ($anchoredFences.Count -ne 1) {
+        return $false
+    }
+    $anchoredFenceCode = $anchoredFences[0].Groups['code'].Value
+
+    # Markdown内のPowerShell fenceを個別にparseする。sole WriteAllTextから
+    # destructive short snippetを逆引きし、comment/string内のdead decoy tryを
+    # contract対象として誤認しない。
+    $fences = [regex]::Matches(
+        $Source,
+        '(?ms)^[ \t]*```powershell[ \t]*\r?\n(?<code>.*?)^[ \t]*```[ \t]*$'
+    )
+    if ($fences.Count -eq 0) {
+        return $false
+    }
+
+    # 英日guide内の全PowerShell fenceを順序付きaggregate digestで固定する。
+    # 個別contract外のstdout helper等に新しいfilesystem provenanceを混ぜない。
+    $fenceAggregate = @(
+        $fences | ForEach-Object {
+            $_.Groups['code'].Value.Replace("`r`n", "`n")
+        }
+    ) -join "`n---CODEX-FENCE---`n"
+    $fenceHasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fenceDigest = [Convert]::ToBase64String(
+            $fenceHasher.ComputeHash(
+                ([System.Text.UTF8Encoding]::new($false)).GetBytes(
+                    $fenceAggregate
+                )
+            )
+        )
+    }
+    finally {
+        $fenceHasher.Dispose()
+    }
+    if (@(
+            'mzBEmrAxtrs+LHigtwW/HtFy52HbvN/wjwDmr44+UY8=',
+            '/FgVJjoIIjqm2KadpTp6KMzIiWKPEAeNSV2dJXmZqsE='
+        ) -cnotcontains $fenceDigest) {
+        return $false
+    }
+
+    $writeContracts = [System.Collections.Generic.List[object]]::new()
+    $bomWriteCount = 0
+    foreach ($fence in $fences) {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $fence.Groups['code'].Value,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        if (@($parseErrors).Count -ne 0) {
+            return $false
+        }
+        $cleanBlockProperty = $ast.PSObject.Properties['CleanBlock']
+        if ($ast.Attributes.Count -ne 0 -or
+            $ast.UsingStatements.Count -ne 0 -or
+            $null -ne $ast.ScriptRequirements -or
+            $null -ne $ast.ParamBlock -or
+            $null -ne $ast.DynamicParamBlock -or
+            $null -ne $ast.BeginBlock -or
+            $null -ne $ast.ProcessBlock -or
+            $null -eq $ast.EndBlock -or
+            ($null -ne $cleanBlockProperty -and
+                $null -ne $cleanBlockProperty.Value) -or
+            -not $ast.EndBlock.Unnamed) {
+            return $false
+        }
+        if (@(
+                $ast.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.TrapStatementAst]
+                    }, $true)
+            ).Count -ne 0) {
+            return $false
+        }
+        # 全PowerShell fenceのmutation sinkを列挙する。actual snippetをunsafe
+        # sinkへ変え、正しいblockをdead functionへ置くdecoyもfail closedにする。
+        foreach ($commandAst in @(
+                $ast.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.CommandAst]
+                    }, $true)
+            )) {
+            if ($commandAst.GetCommandName() -cin @(
+                    'Set-Content',
+                    'Add-Content',
+                    'Out-File',
+                    'Copy-Item',
+                    'Move-Item',
+                    'Remove-Item',
+                    'New-Item',
+                    'New-Object',
+                    'Start-Process',
+                    'Invoke-Expression',
+                    'Tee-Object'
+                )) {
+                return $false
+            }
+        }
+        if (@(
+                $ast.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.FileRedirectionAst]
+                    }, $true)
+            ).Count -ne 0) {
+            return $false
+        }
+        foreach ($memberAst in @(
+                $ast.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+                    }, $true)
+            )) {
+            if (-not $memberAst.Static -and
+                $memberAst.Member.Extent.Text -cin @(
+                    'Write',
+                    'WriteLine',
+                    'WriteAsync',
+                    'Flush',
+                    'FlushAsync',
+                    'SetLength'
+                ) -and
+                $memberAst.Extent.Text -cnotin @(
+                    '$stream.Write($bytes, 0, $bytes.Length)',
+                    '$stream.Flush()'
+                )) {
+                return $false
+            }
+            if ($memberAst.Expression -isnot
+                [System.Management.Automation.Language.TypeExpressionAst]) {
+                continue
+            }
+            $resolvedType = $memberAst.Expression.TypeName.GetReflectionType()
+            if ($null -eq $resolvedType) {
+                continue
+            }
+            if ($resolvedType.FullName -ceq 'System.IO.File' -and
+                $memberAst.Member.Extent.Text -ceq 'WriteAllText') {
+                if ($memberAst.Extent.Text -ceq
+                    '[System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))') {
+                    $writeContracts.Add([pscustomobject]@{
+                            Member = $memberAst
+                            RootEndBlock = $ast.EndBlock
+                            FenceCode = $fence.Groups['code'].Value.Replace("`r`n", "`n")
+                        })
+                    continue
+                }
+                if ($memberAst.Extent.Text -ceq
+                    '[System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($true))') {
+                    $bomWriteCount++
+                    continue
+                }
+                return $false
+            }
+            if (($resolvedType.FullName -ceq 'System.IO.File' -and
+                    $memberAst.Member.Extent.Text -cin @(
+                        'WriteAllBytes',
+                        'WriteAllLines',
+                        'AppendAllText',
+                        'AppendAllLines',
+                        'Open',
+                        'OpenWrite',
+                        'Create',
+                        'CreateText',
+                        'Delete',
+                        'Move',
+                        'Copy',
+                        'Replace',
+                        'Encrypt',
+                        'Decrypt'
+                    )) -or
+                ($resolvedType.FullName -ceq 'System.IO.Directory' -and
+                    $memberAst.Member.Extent.Text -cin @(
+                        'CreateDirectory',
+                        'Delete',
+                        'Move'
+                    )) -or
+                ($resolvedType.FullName -cin @(
+                        'System.IO.FileStream',
+                        'System.IO.StreamWriter'
+                    ) -and $memberAst.Member.Extent.Text -ceq 'new')) {
+                return $false
+            }
+        }
+    }
+    if ($writeContracts.Count -ne 1 -or
+        $bomWriteCount -ne 1 -or
+        $writeContracts[0].FenceCode -cne $anchoredFenceCode) {
+        return $false
+    }
+
+    $snippetBlock = $writeContracts[0].Member.Parent
+    while ($null -ne $snippetBlock -and
+        $snippetBlock -isnot [System.Management.Automation.Language.NamedBlockAst]) {
+        $snippetBlock = $snippetBlock.Parent
+    }
+    [string[]]$expectedSnippetStatementTypes = @(
+        'AssignmentStatementAst',
+        'IfStatementAst',
+        'AssignmentStatementAst',
+        'TryStatementAst',
+        'AssignmentStatementAst',
+        'AssignmentStatementAst',
+        'TryStatementAst',
+        'IfStatementAst',
+        'TryStatementAst'
+    )
+    if ($null -eq $snippetBlock -or
+        -not [object]::ReferenceEquals(
+            $snippetBlock,
+            $writeContracts[0].RootEndBlock
+        ) -or
+        $snippetBlock.Parent -isnot
+            [System.Management.Automation.Language.ScriptBlockAst] -or
+        $snippetBlock.Statements.Count -ne $expectedSnippetStatementTypes.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $expectedSnippetStatementTypes.Count; $index++) {
+        if ($snippetBlock.Statements[$index].GetType().Name -cne
+            $expectedSnippetStatementTypes[$index]) {
+            return $false
+        }
+    }
+
+    # Typed decode failureと直後のcatch-allは、どちらもdirect unconditional return
+    # だけに固定する。read失敗後に未初期化/前値の$tでwriteへ進ませない。
+    $guardedReadTry = $snippetBlock.Statements[3]
+    [string[]]$expectedReadLeft = @('$originalBytes', '$originalDigest', '$t')
+    [string[]]$expectedReadRight = @(
+        '[System.IO.File]::ReadAllBytes($path)',
+        'Get-ByteDigest -Bytes $originalBytes',
+        'ConvertFrom-StrictUtf8Bytes -Bytes $originalBytes'
+    )
+    if ($guardedReadTry.Body.Statements.Count -ne 3 -or
+        $guardedReadTry.CatchClauses.Count -ne 2 -or
+        $null -ne $guardedReadTry.Finally -or
+        $guardedReadTry.CatchClauses[0].CatchTypes.Count -ne 1 -or
+        $guardedReadTry.CatchClauses[0].CatchTypes[0].TypeName.FullName -cne
+            'System.Text.DecoderFallbackException' -or
+        $guardedReadTry.CatchClauses[1].CatchTypes.Count -ne 0) {
+        return $false
+    }
+    for ($index = 0; $index -lt 3; $index++) {
+        $readStatement = $guardedReadTry.Body.Statements[$index]
+        if ($readStatement -isnot
+                [System.Management.Automation.Language.AssignmentStatementAst] -or
+            $readStatement.Operator -ne
+                [System.Management.Automation.Language.TokenKind]::Equals -or
+            $readStatement.Left.Extent.Text -cne $expectedReadLeft[$index] -or
+            $readStatement.Right.Extent.Text -cne $expectedReadRight[$index]) {
+            return $false
+        }
+    }
+    foreach ($catchClause in $guardedReadTry.CatchClauses) {
+        if ($catchClause.Body.Statements.Count -ne 1 -or
+            $catchClause.Body.Statements[0] -isnot
+                [System.Management.Automation.Language.ReturnStatementAst] -or
+            $null -ne $catchClause.Body.Statements[0].Pipeline -or
+            $catchClause.Body.Statements[0].Extent.Text -cne 'return') {
+            return $false
+        }
+    }
+
+    # 同じshort snippetのpre/post guardとwrite catchも固定する。read catchだけが
+    # safeでも、initial/final returnやfixed fatalを弱めればunsafe writeへfall throughする。
+    $initialGuard = $snippetBlock.Statements[1]
+    if ($initialGuard.Clauses.Count -ne 1 -or
+        $null -ne $initialGuard.ElseClause -or
+        $initialGuard.Clauses[0].Item1.Extent.Text -cne
+            '[string]::IsNullOrEmpty([string]$candidateIdentity)' -or
+        $initialGuard.Clauses[0].Item2.Statements.Count -ne 1 -or
+        $initialGuard.Clauses[0].Item2.Statements[0] -isnot
+            [System.Management.Automation.Language.ReturnStatementAst] -or
+        $null -ne $initialGuard.Clauses[0].Item2.Statements[0].Pipeline) {
+        return $false
+    }
+    $expectedCandidateAssignment = @'
+$candidateIdentity = Get-NormalizationCandidateIdentity `
+       -RepoRoot $repo `
+       -RelativePath $relativePath
+'@
+    $expectedLatestIdentityAssignment = @'
+$latestIdentity = Get-NormalizationCandidateIdentity `
+       -RepoRoot $repo `
+       -RelativePath $relativePath
+'@
+    if ($snippetBlock.Statements[0].Extent.Text -cne
+            $expectedCandidateAssignment -or
+        $snippetBlock.Statements[2].Extent.Text -cne
+            '$path = [System.IO.Path]::Combine($repo, $relativePath)' -or
+        $snippetBlock.Statements[4].Extent.Text -cne
+            '$t = ConvertTo-LfTrimmedText -Text $t' -or
+        $snippetBlock.Statements[5].Extent.Text -cne
+            $expectedLatestIdentityAssignment) {
+        return $false
+    }
+
+    $latestDigestTry = $snippetBlock.Statements[6]
+    $expectedLatestDigestAssignment = @'
+$latestDigest = Get-ByteDigest -Bytes (
+           [System.IO.File]::ReadAllBytes($path)
+       )
+'@
+    if ($latestDigestTry.Body.Statements.Count -ne 1 -or
+        $latestDigestTry.Body.Statements[0].Extent.Text -cne
+            $expectedLatestDigestAssignment -or
+        $latestDigestTry.CatchClauses.Count -ne 1 -or
+        $latestDigestTry.CatchClauses[0].CatchTypes.Count -ne 0 -or
+        $latestDigestTry.CatchClauses[0].Body.Statements.Count -ne 1 -or
+        $latestDigestTry.CatchClauses[0].Body.Statements[0] -isnot
+            [System.Management.Automation.Language.ReturnStatementAst] -or
+        $null -ne $latestDigestTry.CatchClauses[0].Body.Statements[0].Pipeline -or
+        $null -ne $latestDigestTry.Finally) {
+        return $false
+    }
+
+    $finalGuard = $snippetBlock.Statements[7]
+    $finalGuardCondition = $finalGuard.Clauses[0].Item1.Extent.Text -replace '\s', ''
+    $expectedFinalGuardCondition =
+        '-not[string]::Equals([string]$candidateIdentity,' +
+        '[string]$latestIdentity,[System.StringComparison]::Ordinal)-or-' +
+        'not[string]::Equals([string]$originalDigest,[string]$latestDigest,' +
+        '[System.StringComparison]::Ordinal)'
+    if ($finalGuard.Clauses.Count -ne 1 -or
+        $null -ne $finalGuard.ElseClause -or
+        $finalGuardCondition -cne $expectedFinalGuardCondition -or
+        $finalGuard.Clauses[0].Item2.Statements.Count -ne 1 -or
+        $finalGuard.Clauses[0].Item2.Statements[0] -isnot
+            [System.Management.Automation.Language.ReturnStatementAst] -or
+        $null -ne $finalGuard.Clauses[0].Item2.Statements[0].Pipeline) {
+        return $false
+    }
+
+    $finalWriteTry = $snippetBlock.Statements[8]
+    if ($finalWriteTry.Body.Statements.Count -ne 1 -or
+        $finalWriteTry.Body.Statements[0].Extent.Text -cne
+            '[System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))' -or
+        $finalWriteTry.CatchClauses.Count -ne 1 -or
+        $finalWriteTry.CatchClauses[0].CatchTypes.Count -ne 0 -or
+        $finalWriteTry.CatchClauses[0].Body.Statements.Count -ne 1 -or
+        $finalWriteTry.CatchClauses[0].Body.Statements[0] -isnot
+            [System.Management.Automation.Language.ThrowStatementAst] -or
+        @(
+            "'Normalization write failed; stop immediately and recover the guarded target before continuing.'",
+            "'正規化のwriteに失敗した。直ちに停止し、guard対象を復旧してから続行すること。'"
+        ) -cnotcontains
+            $finalWriteTry.CatchClauses[0].Body.Statements[0].Pipeline.Extent.Text -or
+        $null -ne $finalWriteTry.Finally) {
+        return $false
+    }
+    return $true
+}
+
+function Assert-NormalizationSkillReadCatchValidatorRegressions {
+    param(
+        [string]$Source,
+        [string]$Description
+    )
+
+    if (-not (Test-NormalizationSkillReadCatchContract -Source $Source)) {
+        Add-Failure "$Description must keep the short normalization AST contract."
+        return
+    }
+    $pathThrowSource = $Source.Replace(
+        "throw 'Normalization write failed; stop immediately and recover the guarded target before continuing.'",
+        'throw $path'
+    ).Replace(
+        "throw '正規化のwriteに失敗した。直ちに停止し、guard対象を復旧してから続行すること。'",
+        'throw $path'
+    )
+    $skillFences = [regex]::Matches(
+        $Source,
+        '(?ms)^[ \t]*```powershell[ \t]*\r?\n(?<code>.*?)^[ \t]*```[ \t]*$'
+    )
+    $destructiveFences = @(
+        $skillFences | Where-Object {
+            $_.Groups['code'].Value.Contains(
+                '[System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))'
+            )
+        }
+    )
+    if ($destructiveFences.Count -ne 1) {
+        Add-Failure "$Description nested-decoy mutation setup is invalid."
+        return
+    }
+    $destructiveCode = $destructiveFences[0].Groups['code'].Value
+    $nestedDeadCode =
+        "function Invoke-DeadNormalizationExample {`n" +
+        ($destructiveCode -replace '(?m)^', '    ') +
+        "`n}`nSet-Content -LiteralPath `$path -Value `$t"
+    $nestedDeadSource = $Source.Replace($destructiveCode, $nestedDeadCode)
+    $usingNamespaceSource = $Source.Replace(
+        $destructiveCode,
+        "using namespace System`n" + $destructiveCode
+    )
+    $requiresVersionSource = $Source.Replace(
+        $destructiveCode,
+        "#requires -Version 5.1`n" + $destructiveCode
+    )
+    $trapSource = $Source.Replace(
+        $destructiveCode,
+        "trap { continue }`n" + $destructiveCode
+    )
+    $mutations = @(
+        @{
+            Name = 'using namespace added outside short EndBlock inventory'
+            Source = $usingNamespaceSource
+        },
+        @{
+            Name = 'requires version added outside short EndBlock inventory'
+            Source = $requiresVersionSource
+        },
+        @{
+            Name = 'short script-scope trap swallows fatal write failure'
+            Source = $trapSource
+        },
+        @{
+            Name = 'bare returns changed to return expressions'
+            Source = $Source.Replace('return', 'return $path')
+        },
+        @{
+            Name = 'bare returns removed'
+            Source = $Source.Replace('return', '$null')
+        },
+        @{
+            Name = 'final identity and digest OR changed to AND'
+            Source = $Source.Replace(') -or -not [string]::Equals(', ') -and -not [string]::Equals(')
+        },
+        @{
+            Name = 'fatal write catch leaks path'
+            Source = $pathThrowSource
+        },
+        @{
+            Name = 'strict byte read changed to lenient text read'
+            Source = $Source.Replace(
+                '$originalBytes = [System.IO.File]::ReadAllBytes($path)',
+                '$originalBytes = [System.IO.File]::ReadAllText($path)'
+            )
+        },
+        @{
+            Name = 'unsafe top-level sink plus nested canonical decoy'
+            Source = $nestedDeadSource
+        },
+        @{
+            Name = 'short type alias used for destructive write'
+            Source = $Source.Replace(
+                '[System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))',
+                '[IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))'
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if ($mutation.Source -ceq $Source) {
+            Add-Failure (
+                "$Description short-snippet mutation setup is invalid: " +
+                $mutation.Name
+            )
+        } elseif (Test-NormalizationSkillReadCatchContract -Source $mutation.Source) {
+            Add-Failure (
+                "$Description short-snippet validator accepted mutation: " +
+                $mutation.Name
+            )
+        }
+    }
+}
+
+function New-GuardedNormalizationHelperRunner {
+    param([string]$Source)
+
+    $fencedCode = Get-GuardedNormalizationPatternCode -Source $Source
+    if ([string]::IsNullOrWhiteSpace([string]$fencedCode)) {
+        return $null
+    }
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $fencedCode,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if (@($parseErrors).Count -ne 0) {
+        return $null
+    }
+    $requiredFunctions = @(
+        'Test-GitRoutingEnvironmentClean',
+        'Get-NormalizedRootPath',
+        'Get-GitRegularMetadata',
+        'Get-GitTrackedRegularFileIdentity',
+        'Test-RepositoryRegularFileBoundary',
+        'Get-NormalizationCandidateIdentity',
+        'Get-ByteDigest',
+        'ConvertFrom-StrictUtf8Bytes',
+        'ConvertTo-LfTrimmedText',
+        'ConvertTo-SafePathLabel'
+    )
+    $definitions = @(
+        $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }, $true) |
+            Where-Object { $_.Name -cin $requiredFunctions } |
+            Sort-Object { $_.Extent.StartOffset }
+    )
+    if ($definitions.Count -ne $requiredFunctions.Count) {
+        return $null
+    }
+    $functionSource = (@($definitions | ForEach-Object { $_.Extent.Text }) -join "`n`n")
+    $runnerTemplate = @'
+param(
+    [string]$Operation,
+    [string]$RepoRoot,
+    [string]$RelativePath,
+    [AllowEmptyString()]
+    [string]$Raw,
+    [string]$Kind,
+    [byte[]]$Bytes,
+    [AllowEmptyString()]
+    [string]$Text
+)
+
+__FUNCTION_SOURCE__
+
+switch ($Operation) {
+    'Boundary' {
+        return Test-RepositoryRegularFileBoundary `
+            -RepoRoot $RepoRoot `
+            -RelativePath $RelativePath
+    }
+    'GitMetadata' {
+        return Get-GitRegularMetadata -Raw $Raw -Kind $Kind
+    }
+    'GitIdentity' {
+        return Get-GitTrackedRegularFileIdentity `
+            -RepoRoot $RepoRoot `
+            -RelativePath $RelativePath
+    }
+    'CandidateIdentity' {
+        return Get-NormalizationCandidateIdentity `
+            -RepoRoot $RepoRoot `
+            -RelativePath $RelativePath
+    }
+    'RoutingEnvironment' {
+        return Test-GitRoutingEnvironmentClean
+    }
+    'SafeLabel' {
+        return ConvertTo-SafePathLabel -RelativePath $RelativePath
+    }
+    'Digest' {
+        return Get-ByteDigest -Bytes $Bytes
+    }
+    'Decode' {
+        return ConvertFrom-StrictUtf8Bytes -Bytes $Bytes
+    }
+    'NormalizeText' {
+        return ConvertTo-LfTrimmedText -Text $Text
+    }
+    default {
+        throw "Unknown guarded-normalization helper operation: $Operation"
+    }
+}
+'@
+    try {
+        return [scriptblock]::Create(
+            $runnerTemplate.Replace('__FUNCTION_SOURCE__', $functionSource)
+        )
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-NormalizationFixtureBoundaryRoot {
+    param([string]$Path)
+
+    # drive rootや`/`では、末尾separator自体がvolume rootの一部である。
+    # rootだけはそのまま保ち、通常directoryだけ余分な末尾separatorを除く。
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $volumeRoot = [System.IO.Path]::GetPathRoot($full)
+        if ([string]::IsNullOrEmpty([string]$volumeRoot)) { return $null }
+        if ($full.Length -le $volumeRoot.Length) { return $full }
+        return $full.TrimEnd([char[]]@(
+                [System.IO.Path]::DirectorySeparatorChar,
+                [System.IO.Path]::AltDirectorySeparatorChar
+            ))
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-NormalizationFixtureCleanupBoundary {
+    param(
+        [string]$FixtureRoot,
+        [string]$FixtureId,
+        [string]$OwnerPath,
+        [string[]]$DirectoryPaths,
+        [string[]]$FilePaths
+    )
+
+    # cleanup直前に所有marker、OS temp直下のexact root、全parent属性を再検査する。
+    try {
+        $tempRoot = Get-NormalizationFixtureBoundaryRoot `
+            -Path ([System.IO.Path]::GetTempPath())
+        if ([string]::IsNullOrEmpty([string]$tempRoot)) { return $false }
+        $actualRoot = [System.IO.Path]::GetFullPath($FixtureRoot)
+        $expectedName = "windows-utf8-normalization-boundary-$FixtureId"
+        $tempAttributes = [System.IO.File]::GetAttributes($tempRoot)
+        if ([System.IO.Path]::GetFileName($actualRoot) -cne $expectedName -or
+            [System.IO.Directory]::GetParent($actualRoot).FullName -cne $tempRoot -or
+            ($tempAttributes -band [System.IO.FileAttributes]::Directory) -eq 0 -or
+            ($tempAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not [System.IO.File]::Exists($OwnerPath) -or
+            [System.IO.File]::ReadAllText($OwnerPath) -cne $FixtureId) {
+            return $false
+        }
+        foreach ($directoryPath in $DirectoryPaths) {
+            $attributes = [System.IO.File]::GetAttributes($directoryPath)
+            if (($attributes -band [System.IO.FileAttributes]::Directory) -eq 0 -or
+                ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+        }
+        foreach ($filePath in $FilePaths) {
+            $attributes = [System.IO.File]::GetAttributes($filePath)
+            if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0 -or
+                ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+        }
+        $expectedList = [System.Collections.Generic.List[string]]::new()
+        foreach ($directoryPath in $DirectoryPaths) {
+            $fullDirectoryPath = [System.IO.Path]::GetFullPath($directoryPath)
+            if (-not [string]::Equals(
+                    $fullDirectoryPath,
+                    $actualRoot,
+                    [System.StringComparison]::Ordinal
+                )) {
+                $expectedList.Add($fullDirectoryPath)
+            }
+        }
+        foreach ($filePath in $FilePaths) {
+            $expectedList.Add([System.IO.Path]::GetFullPath($filePath))
+        }
+        [string[]]$expectedChildren = @($expectedList)
+        [Array]::Sort($expectedChildren, [System.StringComparer]::Ordinal)
+
+        # AllDirectoriesは未知reparseを辿り得る。root直下と、属性確認済みの
+        # 既知directory直下だけを列挙し、未知directoryへは降りない。
+        $actualList = [System.Collections.Generic.List[string]]::new()
+        foreach ($entryPath in [System.IO.Directory]::EnumerateFileSystemEntries($actualRoot)) {
+            $actualList.Add([System.IO.Path]::GetFullPath($entryPath))
+        }
+        foreach ($directoryPath in $DirectoryPaths) {
+            if ([string]::Equals(
+                    [System.IO.Path]::GetFullPath($directoryPath),
+                    $actualRoot,
+                    [System.StringComparison]::Ordinal
+                )) {
+                continue
+            }
+            foreach ($entryPath in [System.IO.Directory]::EnumerateFileSystemEntries($directoryPath)) {
+                $actualList.Add([System.IO.Path]::GetFullPath($entryPath))
+            }
+        }
+        [string[]]$actualChildren = @($actualList)
+        [Array]::Sort($actualChildren, [System.StringComparer]::Ordinal)
+        if ($expectedChildren.Count -ne $actualChildren.Count) {
+            return $false
+        }
+        for ($index = 0; $index -lt $expectedChildren.Count; $index++) {
+            if ($expectedChildren[$index] -cne $actualChildren[$index]) {
+                return $false
+            }
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Assert-GuardedNormalizationBoundarySemantics {
+    param([string]$Source)
+
+    $runner = New-GuardedNormalizationHelperRunner -Source $Source
+    if ($null -eq $runner) {
+        Add-Failure 'Guarded-normalization helper extraction or compilation failed.'
+        return
+    }
+
+    # TEMP/TMPDIRがvolume rootを直接指す構成でもcleanup境界を壊さない。
+    $currentTempPath = [System.IO.Path]::GetFullPath(
+        [System.IO.Path]::GetTempPath()
+    )
+    $volumeRoot = [System.IO.Path]::GetPathRoot($currentTempPath)
+    $normalizedVolumeRoot = Get-NormalizationFixtureBoundaryRoot -Path $volumeRoot
+    if ([string]::IsNullOrEmpty([string]$normalizedVolumeRoot) -or
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath($volumeRoot),
+            $normalizedVolumeRoot,
+            [System.StringComparison]::Ordinal
+        )) {
+        Add-Failure 'Guarded-normalization cleanup changed an exact volume root.'
+    }
+
+    # 実repositoryではread-only queryだけを行い、HEAD/index/top-level合成を確認する。
+    $trackedIdentity = & $runner `
+        -Operation 'GitIdentity' `
+        -RepoRoot $root `
+        -RelativePath 'examples/guarded-normalization.md'
+    if ([string]::IsNullOrEmpty([string]$trackedIdentity)) {
+        Add-Failure 'Guarded-normalization rejected a HEAD/index regular file.'
+    }
+    $candidateIdentity = & $runner `
+        -Operation 'CandidateIdentity' `
+        -RepoRoot $root `
+        -RelativePath 'examples/guarded-normalization.md'
+    if ([string]::IsNullOrEmpty([string]$candidateIdentity)) {
+        Add-Failure 'Guarded-normalization rejected a contained HEAD/index regular file.'
+    }
+    foreach ($invalidIdentityCase in @(
+            @{ RepoRoot = $root; RelativePath = 'synthetic-untracked-normalization.md' },
+            @{ RepoRoot = (Join-Path $root 'examples'); RelativePath = 'guarded-normalization.md' }
+        )) {
+        $identity = & $runner `
+            -Operation 'GitIdentity' `
+            -RepoRoot $invalidIdentityCase.RepoRoot `
+            -RelativePath $invalidIdentityCase.RelativePath
+        if (-not [string]::IsNullOrEmpty([string]$identity)) {
+            Add-Failure 'Guarded-normalization accepted missing HEAD identity or a mismatched top level.'
+        }
+    }
+
+    # alternate indexとcase-insensitive pathspecは大小文字variantも存在だけで拒否する。
+    $routingFixtures = @(
+        @{
+            Name = 'Git_Index_File'
+            Value = [System.IO.Path]::Combine(
+                [System.IO.Path]::GetTempPath(),
+                ('blocked-normalization-index-' + [guid]::NewGuid().ToString('N'))
+            )
+        },
+        @{ Name = 'git_icase_pathspecs'; Value = '1' }
+    )
+    foreach ($routingFixture in $routingFixtures) {
+        $savedValue = [Environment]::GetEnvironmentVariable($routingFixture.Name)
+        $hadValue = $null -ne $savedValue
+        try {
+            [Environment]::SetEnvironmentVariable(
+                $routingFixture.Name,
+                $routingFixture.Value,
+                [EnvironmentVariableTarget]::Process
+            )
+            if (& $runner -Operation 'RoutingEnvironment') {
+                Add-Failure "Guarded-normalization accepted Git routing: $($routingFixture.Name)"
+            }
+            $redirectedIdentity = & $runner `
+                -Operation 'GitIdentity' `
+                -RepoRoot $root `
+                -RelativePath 'examples/guarded-normalization.md'
+            if (-not [string]::IsNullOrEmpty([string]$redirectedIdentity)) {
+                Add-Failure "Guarded-normalization queried with Git routing: $($routingFixture.Name)"
+            }
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                $routingFixture.Name,
+                $(if ($hadValue) { $savedValue } else { $null }),
+                [EnvironmentVariableTarget]::Process
+            )
+        }
+    }
+
+    # pure metadata fixturesは実index/object databaseを書き換えずmode/stage/HEADを固定する。
+    $metadataFixtures = @(
+        @{ Name = 'regular index'; Raw = "100644 abcdef 0`texample.md`0"; Kind = 'Index'; Accepted = $true },
+        @{ Name = 'executable index'; Raw = "100755 abcdef 0`texample.md`0"; Kind = 'Index'; Accepted = $true },
+        @{ Name = 'index symlink'; Raw = "120000 abcdef 0`texample.md`0"; Kind = 'Index'; Accepted = $false },
+        @{ Name = 'index submodule'; Raw = "160000 abcdef 0`texample.md`0"; Kind = 'Index'; Accepted = $false },
+        @{ Name = 'conflict stage'; Raw = "100644 abcdef 1`texample.md`0"; Kind = 'Index'; Accepted = $false },
+        @{ Name = 'multiple index records'; Raw = "100644 abcdef 0`ta.md`0100644 fedcba 0`tb.md`0"; Kind = 'Index'; Accepted = $false },
+        @{ Name = 'regular HEAD blob'; Raw = "100644 blob abcdef`texample.md`0"; Kind = 'Head'; Accepted = $true },
+        @{ Name = 'HEAD symlink'; Raw = "120000 blob abcdef`texample.md`0"; Kind = 'Head'; Accepted = $false },
+        @{ Name = 'HEAD tree'; Raw = "040000 tree abcdef`texample`0"; Kind = 'Head'; Accepted = $false },
+        @{ Name = 'multiple HEAD records'; Raw = "100644 blob abcdef`ta.md`0100644 blob fedcba`tb.md`0"; Kind = 'Head'; Accepted = $false }
+    )
+    foreach ($fixture in $metadataFixtures) {
+        $metadata = & $runner `
+            -Operation 'GitMetadata' `
+            -Raw $fixture.Raw `
+            -Kind $fixture.Kind
+        $accepted = -not [string]::IsNullOrEmpty([string]$metadata)
+        if ($accepted -ne $fixture.Accepted) {
+            Add-Failure "Guarded-normalization metadata fixture failed: $($fixture.Name)"
+        }
+    }
+
+    # byte drift、重複BOM、lone CR、diagnostic spoofingをpure fixtureで確認する。
+    [byte[]]$bytesA = @(0x61, 0x0A)
+    [byte[]]$bytesB = @(0x61, 0x0D, 0x0A)
+    $digestA1 = & $runner -Operation 'Digest' -Bytes $bytesA
+    $digestA2 = & $runner -Operation 'Digest' -Bytes $bytesA
+    $digestB = & $runner -Operation 'Digest' -Bytes $bytesB
+    if ([string]::IsNullOrEmpty([string]$digestA1) -or
+        $digestA1 -cne $digestA2 -or
+        $digestA1 -ceq $digestB) {
+        Add-Failure 'Guarded-normalization byte digest is not stable and discriminating.'
+    }
+
+    [byte[]]$doubleBomUtf8 = @(
+        0xEF, 0xBB, 0xBF,
+        0xEF, 0xBB, 0xBF,
+        0x61
+    )
+    $decoded = & $runner -Operation 'Decode' -Bytes $doubleBomUtf8
+    if ($decoded -cne 'a') {
+        Add-Failure 'Guarded-normalization did not strip repeated leading UTF-8 BOM sequences.'
+    }
+    $invalidUtf8Rejected = $false
+    try {
+        [void](& $runner -Operation 'Decode' -Bytes ([byte[]]@(0x80)))
+    }
+    catch [System.Text.DecoderFallbackException] {
+        $invalidUtf8Rejected = $true
+    }
+    if (-not $invalidUtf8Rejected) {
+        Add-Failure 'Guarded-normalization strict decoder accepted invalid UTF-8.'
+    }
+    $normalizedText = & $runner `
+        -Operation 'NormalizeText' `
+        -Text "a  `r`nb`t `rc `n"
+    if ($normalizedText -cne "a`nb`nc`n") {
+        Add-Failure 'Guarded-normalization did not normalize CRLF/lone-CR and trailing whitespace.'
+    }
+
+    $supplementaryFormat = [char]::ConvertFromUtf32(0xE0020)
+    $emoji = [char]::ConvertFromUtf32(0x1F600)
+    $unsafeName = "line`n$([char]0x1B)[31m$([char]0x202E)$([char]0x2028)$supplementaryFormat$emoji.md"
+    $safeLabel = & $runner -Operation 'SafeLabel' -RelativePath $unsafeName
+    if (-not $safeLabel.Contains('\u000A') -or
+        -not $safeLabel.Contains('\u001B') -or
+        -not $safeLabel.Contains('\u202E') -or
+        -not $safeLabel.Contains('\u2028') -or
+        -not $safeLabel.Contains('\U000E0020') -or
+        -not $safeLabel.Contains($emoji)) {
+        Add-Failure 'Guarded-normalization diagnostic label did not escape unsafe Unicode scalars.'
+    }
+    $labelIndex = 0
+    while ($labelIndex -lt $safeLabel.Length) {
+        $category = [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory(
+            $safeLabel,
+            $labelIndex
+        )
+        if ($category -in @(
+                [System.Globalization.UnicodeCategory]::Control,
+                [System.Globalization.UnicodeCategory]::Format,
+                [System.Globalization.UnicodeCategory]::Surrogate,
+                [System.Globalization.UnicodeCategory]::LineSeparator,
+                [System.Globalization.UnicodeCategory]::ParagraphSeparator
+            )) {
+            Add-Failure 'Guarded-normalization diagnostic label retained an unsafe Unicode scalar.'
+            break
+        }
+        if ([char]::IsHighSurrogate($safeLabel[$labelIndex]) -and
+            $labelIndex + 1 -lt $safeLabel.Length -and
+            [char]::IsLowSurrogate($safeLabel[$labelIndex + 1])) {
+            $labelIndex += 2
+        } else {
+            $labelIndex++
+        }
+    }
+    $boundaryLabel = & $runner `
+        -Operation 'SafeLabel' `
+        -RelativePath (('a' * 159) + $emoji)
+    if (-not $boundaryLabel.Contains($emoji)) {
+        Add-Failure 'Guarded-normalization diagnostic truncation split a surrogate pair.'
+    }
+
+    # OS temp直下に所有fixtureを作り、outside/reparse拒否を実pathで検証する。
+    $fixtureId = [guid]::NewGuid().ToString('N')
+    $fixtureRoot = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "windows-utf8-normalization-boundary-$fixtureId"
+    $fixtureRepo = Join-Path $fixtureRoot 'repo'
+    $fixtureSibling = Join-Path $fixtureRoot 'repo2'
+    $outsideRoot = Join-Path $fixtureRoot 'outside'
+    $regularPath = Join-Path $fixtureRepo 'regular.md'
+    $siblingPath = Join-Path $fixtureSibling 'sibling.md'
+    $outsidePath = Join-Path $outsideRoot 'outside.md'
+    $linkPath = Join-Path $fixtureRepo 'linked'
+    $ownerPath = Join-Path $fixtureRoot '.owner'
+    $traceArtifactPath = Join-Path $fixtureRoot 'trace-output.log'
+    $sentinel = 'outside sentinel must remain unchanged'
+    $linkCreated = $false
+    $linkRemoved = $false
+    try {
+        foreach ($directory in @(
+                $fixtureRoot,
+                $fixtureRepo,
+                $fixtureSibling,
+                $outsideRoot
+            )) {
+            [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+        }
+        [System.IO.File]::WriteAllText($ownerPath, $fixtureId)
+        [System.IO.File]::WriteAllText($regularPath, 'regular')
+        [System.IO.File]::WriteAllText($siblingPath, 'sibling')
+        [System.IO.File]::WriteAllText($outsidePath, $sentinel)
+
+        # Caller trace routing must fail before Git starts and therefore must
+        # not append even one byte to an outside diagnostic target.
+        $previousTrace2Event = [Environment]::GetEnvironmentVariable(
+            'GIT_TRACE2_EVENT',
+            'Process'
+        )
+        try {
+            [Environment]::SetEnvironmentVariable(
+                'GIT_TRACE2_EVENT',
+                $traceArtifactPath,
+                'Process'
+            )
+            $traceRoutedIdentity = & $runner `
+                -Operation 'GitIdentity' `
+                -RepoRoot $root `
+                -RelativePath 'examples/guarded-normalization.md'
+            if (-not [string]::IsNullOrEmpty([string]$traceRoutedIdentity)) {
+                Add-Failure 'Guarded-normalization accepted caller Git trace routing.'
+            }
+        }
+        finally {
+            if ($null -eq $previousTrace2Event) {
+                Microsoft.PowerShell.Management\Remove-Item `
+                    -LiteralPath 'Env:GIT_TRACE2_EVENT' `
+                    -ErrorAction Stop
+            } else {
+                [Environment]::SetEnvironmentVariable(
+                    'GIT_TRACE2_EVENT',
+                    $previousTrace2Event,
+                    'Process'
+                )
+            }
+            $restoredTrace2Event = [Environment]::GetEnvironmentVariable(
+                'GIT_TRACE2_EVENT',
+                'Process'
+            )
+            if (($null -eq $previousTrace2Event -and
+                    [Environment]::GetEnvironmentVariables().Contains(
+                        'GIT_TRACE2_EVENT'
+                    )) -or
+                ($null -ne $previousTrace2Event -and
+                    -not [string]::Equals(
+                        $previousTrace2Event,
+                        $restoredTrace2Event,
+                        [System.StringComparison]::Ordinal
+                    ))) {
+                Add-Failure 'Guarded-normalization could not restore caller Trace2 state.'
+            }
+        }
+        if ([System.IO.File]::Exists($traceArtifactPath)) {
+            Add-Failure 'Guarded-normalization created a caller-routed Git trace artifact.'
+            # pathは直前に作ったowned fixture直下のexact child。削除失敗時は
+            # cleanup boundaryがunknown childを検出してrootを保持する。
+            try {
+                [System.IO.File]::Delete($traceArtifactPath)
+            }
+            catch {
+                Add-Failure 'Guarded-normalization could not remove its trace probe artifact.'
+            }
+        }
+
+        if (-not (& $runner `
+                -Operation 'Boundary' `
+                -RepoRoot $fixtureRepo `
+                -RelativePath 'regular.md')) {
+            Add-Failure 'Guarded-normalization rejected a contained regular file.'
+        }
+        foreach ($outsideCandidate in @(
+                $outsidePath,
+                (Join-Path '..' (Join-Path 'outside' 'outside.md')),
+                (Join-Path '..' (Join-Path 'repo2' 'sibling.md'))
+            )) {
+            if (& $runner `
+                    -Operation 'Boundary' `
+                    -RepoRoot $fixtureRepo `
+                    -RelativePath $outsideCandidate) {
+                Add-Failure 'Guarded-normalization accepted an outside candidate.'
+            }
+        }
+
+        $isWindowsHost = (
+            [System.Environment]::OSVersion.Platform -eq
+            [System.PlatformID]::Win32NT
+        )
+        if ($isWindowsHost) {
+            New-Item `
+                -ItemType Junction `
+                -Path $linkPath `
+                -Target $outsideRoot `
+                -ErrorAction Stop | Out-Null
+        } else {
+            New-Item `
+                -ItemType SymbolicLink `
+                -Path $linkPath `
+                -Target $outsideRoot `
+                -ErrorAction Stop | Out-Null
+        }
+        $linkCreated = $true
+        if (& $runner `
+                -Operation 'Boundary' `
+                -RepoRoot $fixtureRepo `
+                -RelativePath (Join-Path 'linked' 'outside.md')) {
+            Add-Failure 'Guarded-normalization accepted a reparse/symlink parent.'
+        }
+        if ([System.IO.File]::ReadAllText($outsidePath) -cne $sentinel) {
+            Add-Failure 'Guarded-normalization changed the outside sentinel.'
+        }
+    }
+    catch {
+        Add-Failure "Guarded-normalization boundary fixture failed: $($_.Exception.Message)"
+    }
+    finally {
+        # linkを最初にunlinkし、所有境界の再検証後だけ既知file/空directoryを個別削除する。
+        if ($linkCreated -and
+            ([System.IO.Directory]::Exists($linkPath) -or
+                [System.IO.File]::Exists($linkPath))) {
+            try {
+                if ([System.Environment]::OSVersion.Platform -eq
+                    [System.PlatformID]::Win32NT) {
+                    ([System.IO.DirectoryInfo]::new($linkPath)).Delete()
+                } else {
+                    [System.IO.File]::Delete($linkPath)
+                }
+                $linkRemoved = $true
+            }
+            catch {
+                Add-Failure "Guarded-normalization link cleanup failed: $($_.Exception.Message)"
+            }
+        } elseif (-not $linkCreated) {
+            $linkRemoved = $true
+        }
+
+        $directories = @(
+            $fixtureRoot,
+            $fixtureRepo,
+            $fixtureSibling,
+            $outsideRoot
+        )
+        $files = @(
+            $ownerPath,
+            $regularPath,
+            $siblingPath,
+            $outsidePath
+        )
+        if ($linkRemoved -and
+            (Test-NormalizationFixtureCleanupBoundary `
+                -FixtureRoot $fixtureRoot `
+                -FixtureId $fixtureId `
+                -OwnerPath $ownerPath `
+                -DirectoryPaths $directories `
+                -FilePaths $files)) {
+            $childCleanupSucceeded = $true
+            try {
+                foreach ($filePath in @(
+                        $regularPath,
+                        $siblingPath,
+                        $outsidePath
+                    )) {
+                    [System.IO.File]::Delete($filePath)
+                }
+                foreach ($directoryPath in @(
+                        $fixtureRepo,
+                        $fixtureSibling,
+                        $outsideRoot
+                    )) {
+                    [System.IO.Directory]::Delete($directoryPath)
+                }
+            }
+            catch {
+                $childCleanupSucceeded = $false
+                Add-Failure "Guarded-normalization child cleanup failed; owner marker retained: $fixtureRoot"
+            }
+            if ($childCleanupSucceeded) {
+                try {
+                    # owner markerを最後まで残し、root削除の直前だけ外す。
+                    [System.IO.File]::Delete($ownerPath)
+                    [System.IO.Directory]::Delete($fixtureRoot)
+                }
+                catch {
+                    # root削除だけが失敗した場合は、exact通常rootを再確認して
+                    # CreateNewでmarkerを復元する。既存fileは上書きしない。
+                    try {
+                        if ([System.IO.Directory]::Exists($fixtureRoot) -and
+                            -not [System.IO.File]::Exists($ownerPath)) {
+                            $actualRoot = [System.IO.Path]::GetFullPath($fixtureRoot)
+                            $tempRoot = Get-NormalizationFixtureBoundaryRoot `
+                                -Path ([System.IO.Path]::GetTempPath())
+                            $attributes = [System.IO.File]::GetAttributes($actualRoot)
+                            if (-not [string]::IsNullOrEmpty([string]$tempRoot) -and
+                                [System.IO.Path]::GetFileName($actualRoot) -ceq
+                                    "windows-utf8-normalization-boundary-$fixtureId" -and
+                                [System.IO.Directory]::GetParent($actualRoot).FullName -ceq
+                                    $tempRoot -and
+                                ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0 -and
+                                ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                                $markerBytes = [System.Text.Encoding]::UTF8.GetBytes($fixtureId)
+                                $markerStream = [System.IO.File]::Open(
+                                    $ownerPath,
+                                    [System.IO.FileMode]::CreateNew,
+                                    [System.IO.FileAccess]::Write,
+                                    [System.IO.FileShare]::None
+                                )
+                                try {
+                                    $markerStream.Write($markerBytes, 0, $markerBytes.Length)
+                                } finally {
+                                    $markerStream.Dispose()
+                                }
+                            }
+                        }
+                    }
+                    catch {
+                        # Cleanup failure is already fatal; avoid masking it with recovery detail.
+                    }
+                    Add-Failure "Guarded-normalization root cleanup failed; residue retained: $fixtureRoot"
+                }
+            }
+        } else {
+            Add-Failure "Guarded-normalization fixture cleanup boundary failed; residue retained: $fixtureRoot"
+        }
+    }
 }
 
 function Assert-GuardedNormalizationExampleValidatorRegressions {
@@ -1651,109 +4285,382 @@ function Assert-GuardedNormalizationExampleValidatorRegressions {
         Add-Failure "Cannot inspect missing file: $RelativePath (guarded-normalization contract)"
         return
     }
-    try {
-        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-        $source = [System.IO.File]::ReadAllText($filePath, $strictUtf8)
-    }
-    catch {
-        Add-Failure "$RelativePath must be strict UTF-8."
+    $source = Read-StrictUtf8Text `
+        -FilePath $filePath `
+        -Description $RelativePath
+    if ($null -eq $source) {
         return
     }
 
     if (-not (Test-GuardedNormalizationExampleContract -Source $source)) {
-        Add-Failure "$RelativePath must keep the exact array-safe porcelain enumeration block."
+        Add-Failure "$RelativePath must keep the guarded normalization source contract."
         return
     }
+    Assert-GuardedNormalizationBoundarySemantics -Source $source
 
-    # 意味fixtureはfilesystemへ触れず、synthetic NUL recordsだけで
-    # cardinality・Unicode path・rename/delete skipを同時に固定する。
-    $canonicalParser = {
-        param($RepoPath, $Raw)
-        Get-GuardedNormalizationCandidatePaths `
-            -RepoPath $RepoPath `
-            -Raw $Raw
+    # 代表的なweakeningがexact source contractを必ず破ることを自己testする。
+    $patternCode = Get-GuardedNormalizationPatternCode -Source $source
+    $mutationTokens = $null
+    $mutationParseErrors = $null
+    $mutationAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $patternCode,
+        [ref]$mutationTokens,
+        [ref]$mutationParseErrors
+    )
+    $mutationRewriteLoops = @(
+        $mutationAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                    $node.Extent.Text.Contains(
+                        '[System.IO.File]::WriteAllText($path, $t,'
+                    )
+            }, $true)
+    )
+    if (@($mutationParseErrors).Count -ne 0 -or
+        $mutationRewriteLoops.Count -ne 1 -or
+        $mutationRewriteLoops[0].Body.Statements.Count -ne 10) {
+        Add-Failure 'Guarded-normalization reorder mutation setup is invalid.'
+        return
     }
-    if (-not (Test-GuardedNormalizationPorcelainSemantics `
-            -Parser $canonicalParser)) {
-        Add-Failure 'Guarded-normalization porcelain semantics rejected canonical synthetic fixtures.'
+    $mutationGuardText = $mutationRewriteLoops[0].Body.Statements[8].Extent.Text
+    $mutationWriteText = $mutationRewriteLoops[0].Body.Statements[9].Extent.Text
+    $orderedGuardedWriteTail =
+        '    ' + $mutationGuardText + "`n    " + $mutationWriteText
+    $movedWriteBeforeGuardTail =
+        '    ' + $mutationWriteText + "`n    " + $mutationGuardText
+    $movedWriteBeforeGuardCode = $patternCode.Replace(
+        $orderedGuardedWriteTail,
+        $movedWriteBeforeGuardTail
+    )
+    $mutationStatements = @($mutationRewriteLoops[0].Body.Statements)
+    $mutationInitialGuard = $mutationStatements[2]
+    $mutationReadTry = $mutationStatements[4]
+    $mutationFinalGuard = $mutationStatements[8]
+    $mutationFinalWriteTry = $mutationStatements[9]
+    $candidatePathSwapCode = $patternCode.Replace(
+        $mutationStatements[1].Extent.Text,
+        '__CODEX_CANDIDATE_ASSIGNMENT_PLACEHOLDER__'
+    ).Replace(
+        $mutationStatements[3].Extent.Text,
+        $mutationStatements[1].Extent.Text
+    ).Replace(
+        '__CODEX_CANDIDATE_ASSIGNMENT_PLACEHOLDER__',
+        $mutationStatements[3].Extent.Text
+    )
+    $initialGuardWithoutContinueCode = $patternCode.Replace(
+        $mutationInitialGuard.Extent.Text,
+        $mutationInitialGuard.Extent.Text.Replace("`n        continue", '')
+    )
+    $typedReadCatchWithoutContinueCode = $patternCode.Replace(
+        $mutationReadTry.CatchClauses[0].Extent.Text,
+        $mutationReadTry.CatchClauses[0].Extent.Text.Replace("`n        continue", '')
+    )
+    $catchAllReadWithoutContinueCode = $patternCode.Replace(
+        $mutationReadTry.CatchClauses[1].Extent.Text,
+        $mutationReadTry.CatchClauses[1].Extent.Text.Replace("`n        continue", '')
+    )
+    $orderedReadBody =
+        '        ' + $mutationReadTry.Body.Statements[0].Extent.Text + "`n        " +
+        $mutationReadTry.Body.Statements[1].Extent.Text + "`n        " +
+        $mutationReadTry.Body.Statements[2].Extent.Text
+    $decodeBeforeReadBody =
+        '        ' + $mutationReadTry.Body.Statements[2].Extent.Text + "`n        " +
+        $mutationReadTry.Body.Statements[0].Extent.Text + "`n        " +
+        $mutationReadTry.Body.Statements[1].Extent.Text
+    $decodeBeforeReadCode = $patternCode.Replace(
+        $orderedReadBody,
+        $decodeBeforeReadBody
+    )
+    $finalGuardWithoutContinueCode = $patternCode.Replace(
+        $mutationFinalGuard.Extent.Text,
+        $mutationFinalGuard.Extent.Text.Replace("`n        continue", '')
+    )
+    $finalGuardFalseConditionCode = $patternCode.Replace(
+        $mutationFinalGuard.Clauses[0].Item1.Extent.Text,
+        '$false -and (' +
+            $mutationFinalGuard.Clauses[0].Item1.Extent.Text +
+            ')'
+    )
+    $throwPathCode = $patternCode.Replace(
+        $mutationFinalWriteTry.CatchClauses[0].Body.Statements[0].Extent.Text,
+        'throw $path'
+    )
+    $mutationCandidateFunctions = @(
+        $mutationAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq 'Get-NormalizationCandidateIdentity'
+            }, $true)
+    )
+    if ($mutationCandidateFunctions.Count -ne 1) {
+        Add-Failure 'Guarded-normalization candidate mutation setup is invalid.'
+        return
     }
-
-    # fixture自体が空配列の常時返却やskip漏れを見逃す形へ退行していないことを
-    # adversarial parserで検証する。
-    $semanticMutations = @(
-        [pscustomobject]@{
-            Name = 'always-empty parser'
-            Parser = {
-                param($RepoPath, $Raw)
-                return @()
-            }
+    $mutationCandidateText = $mutationCandidateFunctions[0].Extent.Text
+    $candidateEarlyReturnCode = $patternCode.Replace(
+        $mutationCandidateText,
+        $mutationCandidateText.Replace(
+            'function Get-NormalizationCandidateIdentity {',
+            "function Get-NormalizationCandidateIdentity {`n    return 'constant'"
+        )
+    )
+    $candidateLiteralIdentityCode = $patternCode.Replace(
+        $mutationCandidateText,
+        $mutationCandidateText.Replace(
+            '-RelativePath $RelativePath',
+            "-RelativePath 'examples/guarded-normalization.md'"
+        )
+    )
+    $mutationFinalDiagnostic = $mutationAst.EndBlock.Statements[14]
+    $rawDiagnosticOutputCode = $patternCode.Replace(
+        $mutationFinalDiagnostic.Extent.Text,
+        $mutationFinalDiagnostic.Extent.Text.Replace(
+            "`n    `$skipped",
+            "`n    `$path"
+        )
+    )
+    $astSafetyMutations = @(
+        @{
+            Name = 'using namespace added outside EndBlock inventory'
+            Code = "using namespace System`n" + $patternCode
         },
-        [pscustomobject]@{
-            Name = 'rename/delete inclusion'
-            Parser = {
-                param($RepoPath, $Raw)
-                $values = @(
-                    Get-GuardedNormalizationCandidatePaths `
-                        -RepoPath $RepoPath `
-                        -Raw $Raw
-                )
-                if ($Raw.Contains('R  ')) {
-                    $values += Join-Path $RepoPath 'renamed.md'
-                }
-                if ($Raw.Contains(' D ')) {
-                    $values += Join-Path $RepoPath 'deleted.txt'
-                }
-                return $values
-            }
+        @{
+            Name = 'requires version added outside EndBlock inventory'
+            Code = "#requires -Version 5.1`n" + $patternCode
+        },
+        @{
+            Name = 'script-scope trap swallows fatal write failure'
+            Code = "trap { continue }`n" + $patternCode
+        },
+        @{
+            Name = 'System.IO.File Open create sink'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "[System.IO.File]::Open('unguarded.md', [System.IO.FileMode]::Create).Dispose()`n`$skipped = @()"
+            )
+        },
+        @{
+            Name = 'short IO.File Open create sink'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "[IO.File]::Open('unguarded.md', [IO.FileMode]::Create).Dispose()`n`$skipped = @()"
+            )
+        },
+        @{
+            Name = 'case-varied System.IO.File Open create sink'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "[system.io.file]::Open('unguarded.md', [system.io.filemode]::Create).Dispose()`n`$skipped = @()"
+            )
+        },
+        @{
+            Name = 'New-Object StreamWriter instance sink'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                ('$writer = New-Object System.IO.StreamWriter ''unguarded.md''' + "`n" +
+                    '$writer.Write(''x'')' + "`n" +
+                    '$writer.Dispose()' + "`n" +
+                    '$skipped = @()')
+            )
+        },
+        @{
+            Name = 'Trace2 cleanup target broadened'
+            Code = $patternCode.Replace('"Env:$traceName"', '$traceName')
+        },
+        @{
+            Name = 'Trace2 cleanup allowlist broadened'
+            Code = $patternCode.Replace(
+                "@('GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')",
+                "@('GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF', 'HOME')"
+            )
+        },
+        @{
+            Name = 'Trace2 allowlist inherited with compound assignment'
+            Code = $patternCode.Replace(
+                '$trace2OverrideNames = @(',
+                '$trace2OverrideNames += @('
+            )
+        },
+        @{
+            Name = 'Trace2 setup no longer first in try'
+            Code = $patternCode.Replace(
+                "    try {`n        foreach (`$traceName in `$trace2OverrideNames) {",
+                "    try {`n        if (`$false) { }`n        foreach (`$traceName in `$trace2OverrideNames) {"
+            )
+        },
+        @{
+            Name = 'Trace2 set unreachable inside loop'
+            Code = $patternCode.Replace(
+                "        foreach (`$traceName in `$trace2OverrideNames) {`n            [Environment]::SetEnvironmentVariable",
+                "        foreach (`$traceName in `$trace2OverrideNames) {`n            continue`n            [Environment]::SetEnvironmentVariable"
+            )
+        },
+        @{
+            Name = 'Trace2 cleanup unreachable inside loop'
+            Code = $patternCode.Replace(
+                "        foreach (`$traceName in `$trace2OverrideNames) {`n            Microsoft.PowerShell.Management\Remove-Item",
+                "        foreach (`$traceName in `$trace2OverrideNames) {`n            continue`n            Microsoft.PowerShell.Management\Remove-Item"
+            )
+        },
+        @{
+            Name = 'write moved before final identity and digest guard'
+            Code = $movedWriteBeforeGuardCode
+        },
+        @{
+            Name = 'rewrite loop adds an unrequested tracked path'
+            Code = $patternCode.Replace(
+                'foreach ($relativePath in $relativePaths)',
+                "foreach (`$relativePath in @(`$relativePaths; 'README.md'))"
+            )
+        },
+        @{
+            Name = 'candidate and path assignments swapped'
+            Code = $candidatePathSwapCode
+        },
+        @{
+            Name = 'initial candidate guard continue removed'
+            Code = $initialGuardWithoutContinueCode
+        },
+        @{
+            Name = 'typed read catch continue removed'
+            Code = $typedReadCatchWithoutContinueCode
+        },
+        @{
+            Name = 'catch-all read continue removed'
+            Code = $catchAllReadWithoutContinueCode
+        },
+        @{
+            Name = 'strict decode moved before byte read'
+            Code = $decodeBeforeReadCode
+        },
+        @{
+            Name = 'final identity and digest guard continue removed'
+            Code = $finalGuardWithoutContinueCode
+        },
+        @{
+            Name = 'final identity and digest guard forced false'
+            Code = $finalGuardFalseConditionCode
+        },
+        @{
+            Name = 'fatal write catch leaks path'
+            Code = $throwPathCode
+        },
+        @{
+            Name = 'candidate helper early constant return'
+            Code = $candidateEarlyReturnCode
+        },
+        @{
+            Name = 'candidate helper checks another tracked literal'
+            Code = $candidateLiteralIdentityCode
+        },
+        @{
+            Name = 'digest helper returns constant for unmeasured prefix'
+            Code = $patternCode.Replace(
+                'function Get-ByteDigest {',
+                "function Get-ByteDigest {`n    if (`$Bytes.Length -gt 0 -and `$Bytes[0] -eq 0x78) { return 'constant' }"
+            )
+        },
+        @{
+            Name = 'strict decoder strips an extra unmeasured byte'
+            Code = $patternCode.Replace(
+                '    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)',
+                "    if (`$bomLength -eq 6 -and `$Bytes.Length -gt 6 -and `$Bytes[6] -eq 0x78) { `$bomLength++ }`n    `$strictUtf8 = [System.Text.UTF8Encoding]::new(`$false, `$true)"
+            )
+        },
+        @{
+            Name = 'final diagnostics emit raw absolute path'
+            Code = $rawDiagnosticOutputCode
+        },
+        @{
+            Name = 'dynamic Git command changed to clean'
+            Code = $patternCode.Replace(
+                'rev-parse --show-toplevel',
+                'clean -fd'
+            )
+        },
+        @{
+            Name = 'environment trace assignment injected'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "`$env:GIT_TRACE2_EVENT = 'outside'`n`$skipped = @()"
+            )
+        },
+        @{
+            Name = 'guarded path reassigned'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "`$path = 'outside'`n`$skipped = @()"
+            )
+        },
+        @{
+            Name = 'Git executable reassigned'
+            Code = $patternCode.Replace(
+                '$gitExecutable = $gitApplications[0].Source',
+                '$gitExecutable = ''git'''
+            )
+        },
+        @{
+            Name = 'System.IO.Directory create sink'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "[System.IO.Directory]::CreateDirectory('unguarded')`n`$skipped = @()"
+            )
+        },
+        @{
+            Name = 'Start-Process command sink'
+            Code = $patternCode.Replace(
+                '$skipped = @()',
+                "Start-Process pwsh`n`$skipped = @()"
+            )
         }
     )
-    foreach ($mutation in $semanticMutations) {
-        if (Test-GuardedNormalizationPorcelainSemantics `
-                -Parser $mutation.Parser) {
+    foreach ($mutation in $astSafetyMutations) {
+        $tokens = $null
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput(
+            $mutation.Code,
+            [ref]$tokens,
+            [ref]$parseErrors
+        ) | Out-Null
+        if ($mutation.Code -ceq $patternCode -or @($parseErrors).Count -ne 0) {
             Add-Failure (
-                'Guarded-normalization semantic fixtures accepted mutation: ' +
+                'Guarded-normalization AST mutation setup is invalid: ' +
+                $mutation.Name
+            )
+        } elseif (Test-GuardedNormalizationPatternAstSafety `
+                -FencedCode $mutation.Code) {
+            Add-Failure (
+                'Guarded-normalization AST safety accepted mutation: ' +
                 $mutation.Name
             )
         }
     }
 
-    # source validatorへarray/scoping/skipの代表mutationを通し、
-    # correct-looking decoyや重複blockでも合格しないことを固定する。
-    $expectedBlock = Get-GuardedNormalizationExpectedEnumerationBlock
     $sourceMutations = @(
-        [pscustomobject]@{
-            Name = 'scalar entries assignment'
-            Source = $source.Replace(
-                '[string[]]$entries = @(',
-                '$entries = ('
-            )
-        },
-        [pscustomobject]@{
-            Name = 'rename old-path token not skipped'
-            Source = $source.Replace(
-                '    if ($status -match ''R'') { $i++; continue }',
-                '    if ($status -match ''R'') { continue }'
-            )
-        },
-        [pscustomobject]@{
-            Name = 'deleted entry included'
-            Source = $source.Replace(
-                '    if ($status -match ''D'') { continue }',
-                '    if ($status -match ''D'') { $files += Join-Path $repo $path; continue }'
-            )
-        },
-        [pscustomobject]@{
-            Name = 'correct block relocated as decoy'
-            Source = $source.Replace($expectedBlock, '') +
-                "`n" + $expectedBlock
-        },
-        [pscustomobject]@{
-            Name = 'duplicate enumeration block'
-            Source = $source.Replace(
-                $expectedBlock,
-                $expectedBlock + "`n" + $expectedBlock
-            )
-        }
+        @{ Name = 'Git routing check bypassed'; Source = $source.Replace('if (-not (Test-GitRoutingEnvironmentClean)) { return $null }', 'if ($false) { return $null }') },
+        @{ Name = 'case-insensitive pathspec routing allowed'; Source = $source.Replace("        'GIT_ICASE_PATHSPECS'", "        'GIT_UNUSED_PLACEHOLDER'") },
+        @{ Name = 'lazy-fetch environment guard removed'; Source = $source.Replace("        'GIT_NO_LAZY_FETCH'", "        'GIT_UNUSED_LAZY_PLACEHOLDER'") },
+        @{ Name = 'lazy fetch allowed'; Source = $source.Replace(' --no-lazy-fetch', '') },
+        @{ Name = 'Git trace environment accepted'; Source = $source.Replace("            `$name -like 'GIT_TRACE*')", "            `$name -like 'GIT_UNUSED_TRACE*')") },
+        @{ Name = 'Trace2 suppression removed'; Source = $source.Replace("[Environment]::SetEnvironmentVariable(`$traceName, '0', 'Process')", "[Environment]::SetEnvironmentVariable(`$traceName, `$null, 'Process')") },
+        @{ Name = 'Git application resolution bypassed'; Source = $source.Replace('& $gitExecutable --no-replace-objects', '& git --no-replace-objects') },
+        @{ Name = 'Git symlink mode accepted'; Source = $source.Replace("@('100644', '100755')", "@('100644', '100755', '120000')") },
+        @{ Name = 'HEAD identity query removed'; Source = $source.Replace('ls-tree -z HEAD -- $literalPathSpec', 'ls-tree -z HEAD^{tree} -- $literalPathSpec') },
+        @{ Name = 'case-insensitive boundary'; Source = $source.Replace('$comparison = [System.StringComparison]::Ordinal', '$comparison = [System.StringComparison]::OrdinalIgnoreCase') },
+        @{ Name = 'lexical containment bypassed'; Source = $source.Replace('if (-not $candidateFull.StartsWith($rootPrefix, $comparison)) {', 'if ($false) {') },
+        @{ Name = 'reparse rejection removed'; Source = $source.Replace('if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {', 'if ($false) {') },
+        @{ Name = 'candidate composition bypassed'; Source = $source.Replace('if (-not (Test-RepositoryRegularFileBoundary `', 'if ($false -and -not (Test-RepositoryRegularFileBoundary `') },
+        @{ Name = 'write-time identity recheck removed'; Source = $source.Replace('$latestIdentity = Get-NormalizationCandidateIdentity `', '$latestIdentity = $candidateIdentity # guard removed`n#') },
+        @{ Name = 'byte digest mismatch ignored'; Source = $source.Replace('[string]$originalDigest,', '[string]$latestDigest,') },
+        @{ Name = 'only one leading BOM stripped'; Source = $source.Replace('    while ($Bytes.Length - $bomLength -ge 3 -and', '    if ($Bytes.Length - $bomLength -ge 3 -and') },
+        @{ Name = 'lone CR normalization removed'; Source = $source.Replace('.Replace("`r", "`n")', '') },
+        @{ Name = 'supplementary-safe label loop removed'; Source = $source.Replace('$category = [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory(', '$category = [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($RelativePath[$index]) #') },
+        @{ Name = 'raw diagnostic path restored'; Source = $source.Replace('$skipped += "$safeLabel (strict decode failed)"', '$skipped += "$relativePath (strict decode failed)"') },
+        @{ Name = 'write exception handling weakened'; Source = $source.Replace('    } catch {', '    } finally {') },
+        @{ Name = 'automatic status parser restored'; Source = $source.Replace('[string[]]$relativePaths = @(', '$raw = git status --porcelain=v1 -z`n[string[]]$relativePaths = @(') },
+        @{ Name = 'second target assignment'; Source = $source.Replace('$skipped = @()', '$relativePaths = @(''other.md'')`n$skipped = @()') },
+        @{ Name = 'unguarded write sink added'; Source = $source.Replace('$skipped = @()', '[System.IO.File]::WriteAllText(''unguarded.md'', ''x'')`n$skipped = @()') },
+        @{ Name = 'canonical fence relocated as decoy'; Source = $source.Replace($patternCode, '# removed from executable fence') + "`n" + $patternCode }
     )
     foreach ($mutation in $sourceMutations) {
         if ($mutation.Source -ceq $source) {
@@ -1761,8 +4668,7 @@ function Assert-GuardedNormalizationExampleValidatorRegressions {
                 'Guarded-normalization source mutation setup made no change: ' +
                 $mutation.Name
             )
-        } elseif (Test-GuardedNormalizationExampleContract `
-                -Source $mutation.Source) {
+        } elseif (Test-GuardedNormalizationExampleContract -Source $mutation.Source) {
             Add-Failure (
                 'Guarded-normalization source validator accepted mutation: ' +
                 $mutation.Name
@@ -1770,7 +4676,6 @@ function Assert-GuardedNormalizationExampleValidatorRegressions {
         }
     }
 }
-
 function Test-PosixContainmentEvidenceContract {
     param(
         [string]$ProcessSource,
@@ -3618,7 +6523,13 @@ function Test-SkillFrontmatter {
         return
     }
 
-    $lines = Get-Content -LiteralPath $skillPath
+    $content = Read-StrictUtf8Text `
+        -FilePath $skillPath `
+        -Description 'SKILL.md frontmatter source'
+    if ($null -eq $content) {
+        return
+    }
+    [string[]]$lines = @($content.Replace("`r`n", "`n") -split "`n")
     if ($lines.Count -lt 4 -or $lines[0] -ne '---') {
         Add-Failure 'SKILL.md must start with YAML frontmatter.'
         return
@@ -3896,6 +6807,112 @@ Assert-ScannerRegexPolicyValidatorRegressions `
     -RelativePath 'scripts/scan-private-markers.ps1'
 Assert-GuardedNormalizationExampleValidatorRegressions `
     -RelativePath 'examples/guarded-normalization.md'
+Assert-FileContains `
+    -RelativePath 'examples/guarded-normalization.md' `
+    -Pattern 'function\s+Get-GitTrackedRegularFileIdentity' `
+    -Description 'git index regular-file mode guard before normalization'
+Assert-FileContains `
+    -RelativePath 'examples/guarded-normalization.md' `
+    -Pattern 'FileAttributes\]::ReparsePoint' `
+    -Description 'normalization reparse-point rejection'
+Assert-FileContains `
+    -RelativePath 'examples/guarded-normalization.md' `
+    -Pattern 'function\s+Get-NormalizationCandidateIdentity' `
+    -Description 'combined tracked-file and repository-boundary guard'
+foreach ($normalizationGuide in @(
+        'README.md',
+        'SKILL.md',
+        'docs/SKILL.ja.md',
+        'examples/guarded-normalization.md'
+    )) {
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(explicit.{0,160}target|target.{0,160}explicit|明示.{0,160}対象|対象.{0,160}明示)' `
+        -Description 'explicit normalization target-list contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)HEAD.{0,200}index|index.{0,200}HEAD' `
+        -Description 'HEAD and index normalization identity contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(Git.{0,80}routing|routing.{0,80}Git)' `
+        -Description 'Git routing-environment rejection contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?i)Git\s+routing/config/pathspec/trace' `
+        -Description 'Git routing/config/pathspec/trace rejection contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(raw[- ]byte|raw bytes|raw-byte).{0,120}digest|digest.{0,120}(raw[- ]byte|raw bytes|raw-byte)' `
+        -Description 'raw-byte digest recheck contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?i)reparse' `
+        -Description 'normalization reparse-point rejection contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?i)hard link|hardlink' `
+        -Description 'normalization hard-link residual risk'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(diagnostic|表示).{0,160}(control|format)' `
+        -Description 'normalization diagnostic escaping contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?i)--no-lazy-fetch|GIT_NO_LAZY_FETCH' `
+        -Description 'normalization lazy-fetch rejection contract'
+    foreach ($trace2OverrideName in @(
+            'GIT_TRACE2',
+            'GIT_TRACE2_EVENT',
+            'GIT_TRACE2_PERF'
+        )) {
+        Assert-FileContains `
+            -RelativePath $normalizationGuide `
+            -Pattern (
+                '(?<![A-Z0-9_])' +
+                [regex]::Escape($trace2OverrideName) +
+                '(?![A-Z0-9_])'
+            ) `
+            -Description (
+                'normalization Trace2 target suppression contract: ' +
+                $trace2OverrideName
+            )
+    }
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(dedicated.{0,80}single-threaded|専用.{0,80}single-threaded)' `
+        -Description 'dedicated single-threaded PowerShell process contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)runspace.{0,120}thread.{0,120}child' `
+        -Description 'same-process runspace/thread/child exclusion contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(application.{0,160}trusted|trusted.{0,160}application)' `
+        -Description 'normalization Git application trust contract'
+    Assert-FileContains `
+        -RelativePath $normalizationGuide `
+        -Pattern '(?is)(fatal.{0,320}path-free|固定.{0,180}即時停止)' `
+        -Description 'normalization fatal write contract'
+}
+foreach ($normalizationSkillGuide in @('SKILL.md', 'docs/SKILL.ja.md')) {
+    Assert-FileContains `
+        -RelativePath $normalizationSkillGuide `
+        -Pattern '\[System\.IO\.Path\]::Combine\(\$repo, \$relativePath\)' `
+        -Description 'fully qualified guarded-normalization target composition'
+    Assert-FileDoesNotContain `
+        -RelativePath $normalizationSkillGuide `
+        -Pattern '\$path\s*=\s*Join-Path\s+\$repo\s+\$relativePath' `
+        -Description 'unqualified guarded-normalization target composition'
+    $normalizationSkillSource = Read-StrictUtf8Text `
+        -FilePath (Get-RepoFilePath -RelativePath $normalizationSkillGuide) `
+        -Description $normalizationSkillGuide
+    if ($null -ne $normalizationSkillSource) {
+        Assert-NormalizationSkillReadCatchValidatorRegressions `
+            -Source $normalizationSkillSource `
+            -Description $normalizationSkillGuide
+    }
+}
 
 Assert-EditorConfigUtf8BomAllowlist -RelativePath '.editorconfig'
 Assert-EditorConfigUtf8BomAllowlistValidatorRegressions `

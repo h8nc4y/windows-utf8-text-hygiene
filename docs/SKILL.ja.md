@@ -100,8 +100,18 @@ encoding を正規化・検証するための手順です。守る規約は
 
 ### 正規化（破壊的。実行前に必ず下の「安全条件」を満たすこと）
 
-4. まず strict UTF-8 デコード検査を通し、**通ったものだけ** BOM 除去 +
-   LF 化 + 行末空白除去して書き直す。引数なしの `ReadAllText($path)` は
+4. 対象pathは明示的に列挙する。native `git ... -z` の出力をPowerShellの
+   textとして取り込む方式は、有効なPOSIX filename内のCR/LFを失うため使わない。
+   各pathがHEADとstage 0 indexの両方で通常Git blob（`100644` / `100755`）
+   であり、ambientなGit routing/config環境変数がなく、要求したrepo rootと
+   exact top-levelが一致することを確認する。さらにrepo内へlexical containment
+   され、targetまでの全parentを含めて通常non-reparse pathであることを確認する。
+   read前とwrite直前に同じHEAD/index mode/OID/stage、path境界、raw-byte digestを
+   再取得する。copy-adaptableなhelperは
+   [guarded-normalization example](../examples/guarded-normalization.md)を正本とし、
+   `Test-Path`、tracked名だけの確認、自動status parserへ弱めない。そのうえでstrict UTF-8
+   デコード検査を通し、**通ったものだけ** BOM 除去 + LF 化 + 行末空白除去
+   して書き直す。引数なしの `ReadAllText($path)` は
    不正な UTF-8 バイトを U+FFFD に**黙って置換**するため、ANSI /
    Shift_JIS（CP932）ファイルにこの手順を適用すると元テキストを不可逆
    破壊する。CP932 の「日本語テスト」で実測: strict 読みは
@@ -111,21 +121,52 @@ encoding を正規化・検証するための手順です。守る規約は
    encoding 次第で変わるが、元のバイトはどう見ても失われている）:
 
    ```powershell
+   $candidateIdentity = Get-NormalizationCandidateIdentity `
+       -RepoRoot $repo `
+       -RelativePath $relativePath
+   if ([string]::IsNullOrEmpty([string]$candidateIdentity)) { return }
+   $path = [System.IO.Path]::Combine($repo, $relativePath)
    try {
-       # throwOnInvalidBytes=true: 不正 UTF-8（ANSI/Shift_JIS 等）なら黙って
-       # 壊す代わりに例外を投げる。先頭 BOM は読み込み時に自動で外れる
-       $t = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false, $true))
+       $originalBytes = [System.IO.File]::ReadAllBytes($path)
+       $originalDigest = Get-ByteDigest -Bytes $originalBytes
+       # 先頭の重複BOMをすべて外し、throwOnInvalidBytes=trueで検査する
+       $t = ConvertFrom-StrictUtf8Bytes -Bytes $originalBytes
    } catch [System.Text.DecoderFallbackException] {
        # このファイルは UTF-8 ではない。正規化を中止し、encoding 変換は別判断として
        # 報告の未確認事項に残す（勝手に Shift_JIS→UTF-8 変換しない）。他ファイルの作業は継続
        return
+   } catch {
+       # その他のread例外はraw pathを含み得る。例外本文を再表示せず、
+       # 固定の安全な理由だけを報告してこの対象を見送る
+       return
    }
-   $t = $t.Replace("`r`n", "`n")
-   $t = ($t -split "`n" | ForEach-Object { $_.TrimEnd() }) -join "`n"
-   [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))  # BOM なし
+   $t = ConvertTo-LfTrimmedText -Text $t  # CRLFとlone CRをLFへ変換
+   $latestIdentity = Get-NormalizationCandidateIdentity `
+       -RepoRoot $repo `
+       -RelativePath $relativePath
+   try {
+       $latestDigest = Get-ByteDigest -Bytes (
+           [System.IO.File]::ReadAllBytes($path)
+       )
+   } catch { return }
+   if (-not [string]::Equals(
+           [string]$candidateIdentity,
+           [string]$latestIdentity,
+           [System.StringComparison]::Ordinal
+       ) -or -not [string]::Equals(
+           [string]$originalDigest,
+           [string]$latestDigest,
+           [System.StringComparison]::Ordinal
+       )) { return }
+   try {
+       [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($false))  # BOM なし
+   } catch {
+       throw '正規化のwriteに失敗した。直ちに停止し、guard対象を復旧してから続行すること。'
+   }
    ```
 
-5. Windows PowerShell 5.1 で実行する `.ps1` だけは BOM 付きで書く:
+5. Windows PowerShell 5.1 で実行する `.ps1` だけは、同じ二重検査block内の
+   最後のwriteでBOM付きencoderを使う:
 
    ```powershell
    [System.IO.File]::WriteAllText($path, $t, [System.Text.UTF8Encoding]::new($true))
@@ -183,14 +224,32 @@ $out = $tpl.Replace('__NAME__', $value)
 
 正規化（手順 4–5）の前提チェック — 全項目を先に満たす:
 
-- [ ] 対象ファイルが git 管理下で、`git diff` / `git checkout -- <file>`
-  で直前状態に戻れる。未追跡ファイルは先にバックアップコピーを取る。
+- [ ] 明示した対象がHEADの通常blobであり、stage 0のGit index entryもexact
+  1件、modeが`100644`または`100755`である。untracked、intent-to-add、
+  conflict、symlink（`120000`）、submodule（`160000`）はskipする。HEADにない
+  path（典型的なstaged additionと新しいrename destinationを含む）は拒否する。
+  Gitは一般的なrename bitを保持しないため、既存destinationはそのpath自身の
+  HEAD/index identityで判定する。
+- [ ] Git routing/config/pathspec/trace環境変数がなく、
+  `git rev-parse --show-toplevel`が要求した
+  repo rootとordinal比較で一致する。case-insensitive pathspec変数も拒否する。
+  alias/functionによる偽装を避けてGit applicationを解決し、選ばれるPATH/
+  application自体はtrustedであること。`--no-lazy-fetch`を使い、同期実行する
+  3つのidentity queryの間だけ`GIT_TRACE2`、`GIT_TRACE2_EVENT`、
+  `GIT_TRACE2_PERF`を`0`にして`finally`で除去する。専用のsingle-threaded
+  PowerShell processで実行し、同じprocess内の別runspace・thread・child起動を
+  override期間と重ねない。
+- [ ] 対象はrepo内にlexical containmentされ、repo root・全parent・leafが
+  通常non-reparse pathである。missing、access failure、symlink、junctionは
+  fail closedにし、write直前にpath chain、exact HEAD/index mode/OID/stage、
+  元raw bytesのdigestを再検査する。
 - [ ] strict UTF-8 デコード（`[System.Text.UTF8Encoding]::new($false,
   $true)`）が例外なく通ること。通らないファイルは ANSI / Shift_JIS 混入の
   疑いがあり、手順 4–5 を適用しない。encoding 変換を副作用として実施せず、
-  報告の未確認事項に残す。
-- [ ] 対象は自分が変更・追加したテキストファイルのみ。バイナリ（画像・
-  exe 等）、vendored、`node_modules` 等の生成物には適用しない。
+  報告の未確認事項に残す。先頭の重複UTF-8 BOMをすべて除去し、CRLFだけでなく
+  lone CRもLFへ変換する。
+- [ ] 対象は自分で選び変更した既存HEAD-tracked textだけ。HEADにないpath、
+  バイナリ（画像・exe 等）、vendored、`node_modules` 等の生成物には適用しない。
 - [ ] `.ps1` から BOM を外す前に、そのスクリプトが Windows PowerShell 5.1
   経由で実行されないことを確認する（対話シェルが pwsh 7 でも、hook・
   タスクスケジューラは 5.1 経由の可能性がある）。
@@ -198,6 +257,16 @@ $out = $tpl.Replace('__NAME__', $value)
   （`.gitattributes` / `core.autocrlf` の方針と衝突して巨大 diff を作る）。
   判断がつかない場合も一括変換は実行せず、変更ファイル単位に限定して
   作業を継続し、見送った判断を報告の未確認事項に残す（停止しない）。
+- [ ] このportable patternは、敵対的な同時変更のないtrusted local checkout
+  だけで使う。final digest-check/write間には小さなraceが残り、hard linkや
+  Unix mount差替えは検知できない。完全に閉じるにはOS固有のno-follow handleと
+  file identity検査が必要で、copy snippetの範囲外である。
+- [ ] raw pathはfilesystem/Git APIだけへ渡す。terminalへ出すdiagnostic labelでは、
+  BMP/supplementaryのcontrol・format scalar、unpaired surrogate、Unicode line/
+  paragraph separatorを可視escapeする。
+- [ ] 最終`WriteAllText`の例外はskip扱いにしない。truncate後に失敗する可能性が
+  あるため、pathを含まない固定エラーで即時停止し、対象を確認してtrusted backup、
+  HEAD、indexのうち適切な復旧元を選んでから続行する。
 - [ ] タブが構文上必須のファイル（Makefile 等）には手順 8 の制御文字検査を
   機械適用しない。誤検出したら対象から外して継続する。
 
